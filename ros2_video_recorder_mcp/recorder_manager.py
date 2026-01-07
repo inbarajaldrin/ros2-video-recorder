@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 import json
 
 # Import ROS2 dependencies at module level
@@ -33,19 +33,24 @@ except ImportError as e:
 class VideoRecorderNode(Node):
     """ROS2 node that subscribes to camera topics and records video"""
 
-    def __init__(self, camera_topic: str, fps: int, width: int, height: int,
-                 overlay_timestamp: bool, output_path: str, video_codec: str):
+    def __init__(self, camera_topic: str, fps: Optional[int], width: Optional[int], height: Optional[int],
+                 overlay_timestamp: bool, output_path: str, video_codec: str,
+                 auto_fps: bool = False, auto_resolution: bool = False,
+                 on_values_detected: Optional[Callable[[], None]] = None):
         """
         Initialize the video recorder node
 
         Args:
             camera_topic: ROS2 image topic to subscribe to
-            fps: Frames per second for recording
-            width: Video width in pixels
-            height: Video height in pixels
+            fps: Frames per second for recording (None if auto)
+            width: Video width in pixels (None if auto)
+            height: Video height in pixels (None if auto)
             overlay_timestamp: Whether to overlay timestamp on frames
             output_path: Path to save the video file
             video_codec: Codec to use (e.g., 'mp4v', 'XVID')
+            auto_fps: Auto-detect FPS from topic
+            auto_resolution: Auto-detect resolution from first frame
+            on_values_detected: Optional callback when values are auto-detected
         """
         super().__init__('video_recorder_node')
 
@@ -56,12 +61,24 @@ class VideoRecorderNode(Node):
         self.overlay_timestamp = overlay_timestamp
         self.output_path = output_path
         self.video_codec = video_codec
+        self.auto_fps = auto_fps
+        self.auto_resolution = auto_resolution
+        self.on_values_detected = on_values_detected
 
         self.bridge = CvBridge()
         self.video_writer = None
         self.frame_count = 0
         self.is_recording = False
         self.lock = threading.Lock()
+        self.video_writer_initialized = False
+
+        # For auto FPS detection
+        self.frame_timestamps = []
+        self.last_frame_time = None
+        
+        # Event to signal when values are detected (for async waiting)
+        self.values_detected_event = None  # Will be set by manager if needed
+        self.event_loop = None  # Will be set by manager if needed
 
         # Subscribe to the camera topic
         self.subscription = self.create_subscription(
@@ -71,20 +88,26 @@ class VideoRecorderNode(Node):
             10
         )
 
-        # Initialize video writer
-        fourcc = cv2.VideoWriter_fourcc(*video_codec)
-        self.video_writer = cv2.VideoWriter(
-            output_path,
-            fourcc,
-            fps,
-            (width, height)
-        )
+        # Initialize video writer if all parameters are provided
+        if fps is not None and width is not None and height is not None:
+            fourcc = cv2.VideoWriter_fourcc(*video_codec)
+            self.video_writer = cv2.VideoWriter(
+                output_path,
+                fourcc,
+                fps,
+                (width, height)
+            )
 
-        if not self.video_writer.isOpened():
-            raise RuntimeError(f"Failed to open video writer for {output_path}")
+            if not self.video_writer.isOpened():
+                raise RuntimeError(f"Failed to open video writer for {output_path}")
 
-        self.is_recording = True
-        self.get_logger().info(f"Recording started: {output_path}")
+            self.video_writer_initialized = True
+            self.is_recording = True
+            self.get_logger().info(f"Recording started: {output_path}")
+        else:
+            # Will initialize on first frame
+            self.is_recording = True
+            self.get_logger().info(f"Recording started (auto-detect mode): {output_path}")
 
     def image_callback(self, msg: Image):
         """Callback for image subscription"""
@@ -95,8 +118,56 @@ class VideoRecorderNode(Node):
             # Convert ROS2 image to OpenCV format
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
-            # Resize if necessary
-            if frame.shape[0] != self.height or frame.shape[1] != self.width:
+            # Auto-detect resolution from first frame if needed
+            if not self.video_writer_initialized:
+                if self.auto_resolution or self.height is None or self.width is None:
+                    self.height = frame.shape[0]
+                    self.width = frame.shape[1]
+                    self.get_logger().info(f"Auto-detected resolution: {self.width}x{self.height}")
+
+                # Auto-detect FPS if needed (will calculate from first few frames)
+                if self.auto_fps or self.fps is None:
+                    current_time = datetime.now().timestamp()
+                    if self.last_frame_time is not None:
+                        frame_interval = current_time - self.last_frame_time
+                        if frame_interval > 0:
+                            self.frame_timestamps.append(frame_interval)
+                            # Use average of last 10 intervals for FPS calculation
+                            if len(self.frame_timestamps) >= 10:
+                                avg_interval = sum(self.frame_timestamps[-10:]) / len(self.frame_timestamps[-10:])
+                                self.fps = int(round(1.0 / avg_interval))
+                                self.get_logger().info(f"Auto-detected FPS: {self.fps}")
+                    self.last_frame_time = current_time
+
+                    # Use default FPS if not yet detected
+                    if self.fps is None:
+                        self.fps = 30  # Default fallback
+
+                # Initialize video writer now that we have all parameters
+                fourcc = cv2.VideoWriter_fourcc(*self.video_codec)
+                self.video_writer = cv2.VideoWriter(
+                    self.output_path,
+                    fourcc,
+                    self.fps,
+                    (self.width, self.height)
+                )
+
+                if not self.video_writer.isOpened():
+                    raise RuntimeError(f"Failed to open video writer for {self.output_path}")
+
+                self.video_writer_initialized = True
+                self.get_logger().info(f"Video writer initialized: {self.width}x{self.height} @ {self.fps} fps")
+                
+                # Signal that values are detected (thread-safe)
+                if self.values_detected_event and self.event_loop:
+                    self.event_loop.call_soon_threadsafe(self.values_detected_event.set)
+                
+                # Notify callback if values were auto-detected
+                if self.on_values_detected:
+                    self.on_values_detected()
+
+            # Resize if necessary (only if not auto-detected)
+            if not self.auto_resolution and (frame.shape[0] != self.height or frame.shape[1] != self.width):
                 frame = cv2.resize(frame, (self.width, self.height))
 
             # Overlay timestamp if requested
@@ -114,7 +185,7 @@ class VideoRecorderNode(Node):
 
             # Write frame to video
             with self.lock:
-                if self.video_writer.isOpened():
+                if self.video_writer and self.video_writer.isOpened():
                     self.video_writer.write(frame)
                     self.frame_count += 1
 
@@ -189,7 +260,7 @@ class VideoRecorderManager:
             try:
                 self.executor.spin_once(timeout_sec=0.1)
             except Exception as e:
-                print(f"Executor error: {e}")
+                # Silently handle executor errors (usually happens during shutdown)
                 break
 
     def _generate_filename(self, file_prefix: str = "", file_postfix: str = "",
@@ -208,6 +279,17 @@ class VideoRecorderManager:
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f)
+
+    def _update_state_with_detected_values(self):
+        """Update state file with auto-detected values from recorder node"""
+        if self.recorder_node and self.recorder_node.video_writer_initialized:
+            state = self._load_state()
+            if state:
+                params = state.get("params", {})
+                params["fps"] = self.recorder_node.fps
+                params["image_width"] = self.recorder_node.width
+                params["image_height"] = self.recorder_node.height
+                self._save_state(params)
 
     def _load_state(self) -> Optional[dict]:
         """Load recording state from file"""
@@ -232,14 +314,14 @@ class VideoRecorderManager:
     async def start_recording(
         self,
         camera_topic: str = "/camera_input",
-        fps: int = 30,
-        image_height: int = 720,
-        image_width: int = 1280,
+        fps: Optional[int] = None,
+        image_height: Optional[int] = None,
+        image_width: Optional[int] = None,
         overlay_timestamp: bool = False,
         folder_path: Optional[str] = None,
         video_length: int = 0,
-        auto_fps: bool = False,
-        auto_resolution: bool = False,
+        auto_fps: bool = True,
+        auto_resolution: bool = True,
         video_codec: str = "mp4v",
         file_prefix: str = "",
         file_postfix: str = "",
@@ -250,14 +332,14 @@ class VideoRecorderManager:
 
         Args:
             camera_topic: ROS2 topic name for camera images
-            fps: Frame rate for recording (1-120)
-            image_height: Image height in pixels
-            image_width: Image width in pixels
+            fps: Frame rate for recording (1-120). If None, auto-detects from topic (default: None)
+            image_height: Image height in pixels. If None, auto-detects from first frame (default: None)
+            image_width: Image width in pixels. If None, auto-detects from first frame (default: None)
             overlay_timestamp: Whether to overlay timestamp on frames
             folder_path: Directory to save videos
             video_length: Length of video segment in seconds (0 = continuous)
-            auto_fps: Auto-detect topic framerate (not yet implemented)
-            auto_resolution: Auto-detect image resolution (not yet implemented)
+            auto_fps: Auto-detect topic framerate (default: True). Disabled if fps is explicitly set
+            auto_resolution: Auto-detect image resolution (default: True). Disabled if width/height are explicitly set
             video_codec: Video codec to use (default: mp4v)
             file_prefix: Prefix for output filename
             file_postfix: Postfix for output filename
@@ -274,6 +356,10 @@ class VideoRecorderManager:
             # Initialize ROS2
             self._initialize_rclpy()
 
+            # Only use auto modes if values are not explicitly set
+            use_auto_fps = auto_fps and fps is None
+            use_auto_resolution = auto_resolution and (image_width is None or image_height is None)
+
             # Use provided or default folder path
             if folder_path is None:
                 folder_path = self.default_folder_path
@@ -283,6 +369,14 @@ class VideoRecorderManager:
             filename = self._generate_filename(file_prefix, file_postfix, file_type)
             self.current_output_path = str(Path(folder_path) / filename)
 
+            # Create event for signaling when values are detected (if auto-detection is enabled)
+            values_detected_event = None
+            if use_auto_fps or use_auto_resolution:
+                values_detected_event = asyncio.Event()
+                event_loop = asyncio.get_event_loop()
+            else:
+                event_loop = None
+
             # Create and start the recorder node
             self.recorder_node = VideoRecorderNode(
                 camera_topic=camera_topic,
@@ -291,8 +385,16 @@ class VideoRecorderManager:
                 height=image_height,
                 overlay_timestamp=overlay_timestamp,
                 output_path=self.current_output_path,
-                video_codec=video_codec
+                video_codec=video_codec,
+                auto_fps=use_auto_fps,
+                auto_resolution=use_auto_resolution,
+                on_values_detected=self._update_state_with_detected_values
             )
+            
+            # Set event and loop in node for signaling
+            if values_detected_event:
+                self.recorder_node.values_detected_event = values_detected_event
+                self.recorder_node.event_loop = event_loop
 
             # Start executor thread if not already running
             self._start_executor_thread()
@@ -301,8 +403,8 @@ class VideoRecorderManager:
             if self.executor:
                 self.executor.add_node(self.recorder_node)
 
-            # Give the subscription a moment to connect
-            await asyncio.sleep(0.5)
+            # Give executor a moment to start processing (allows first message to arrive)
+            await asyncio.sleep(0.05)
 
             # Save state
             params = {
@@ -320,11 +422,52 @@ class VideoRecorderManager:
             }
             self._save_state(params)
 
+            # Wait for first frame to be received and values to be detected (if auto-detection is enabled)
+            values_detected = False
+            if use_auto_fps or use_auto_resolution:
+                # Check if already detected (might have happened during the sleep above)
+                if self.recorder_node and self.recorder_node.video_writer_initialized:
+                    values_detected = True
+                    self._update_state_with_detected_values()
+                elif not values_detected_event.is_set():
+                    try:
+                        # Wait for event with 5 second timeout
+                        await asyncio.wait_for(values_detected_event.wait(), timeout=5.0)
+                        values_detected = True
+                        self._update_state_with_detected_values()
+                    except asyncio.TimeoutError:
+                        # Timeout - check if detection happened anyway (event might have been set)
+                        if self.recorder_node and self.recorder_node.video_writer_initialized:
+                            values_detected = True
+                            self._update_state_with_detected_values()
+                else:
+                    # Event was already set
+                    values_detected = True
+                    self._update_state_with_detected_values()
+            else:
+                # Just give subscription time to connect
+                await asyncio.sleep(0.4)
+
             result = "Recording started successfully!\n"
             result += f"Output file: {self.current_output_path}\n"
             result += f"Camera topic: {camera_topic}\n"
-            result += f"FPS: {fps}\n"
-            result += f"Resolution: {image_width}x{image_height}\n"
+            
+            # Show actual FPS (detected or set)
+            if values_detected and self.recorder_node:
+                result += f"FPS: {self.recorder_node.fps}\n"
+            elif fps is not None:
+                result += f"FPS: {fps}\n"
+            else:
+                result += f"FPS: Auto-detect (detecting...)\n"
+            
+            # Show actual resolution (detected or set)
+            if values_detected and self.recorder_node:
+                result += f"Resolution: {self.recorder_node.width}x{self.recorder_node.height}\n"
+            elif image_width is not None and image_height is not None:
+                result += f"Resolution: {image_width}x{image_height}\n"
+            else:
+                result += f"Resolution: Auto-detect (detecting...)\n"
+            
             result += f"Overlay timestamp: {overlay_timestamp}\n"
             result += f"Video length: {'continuous' if video_length == 0 else f'{video_length} seconds'}\n"
 
@@ -347,7 +490,12 @@ class VideoRecorderManager:
             return "No recording in progress."
 
         try:
+            # Capture frame count and fps before cleanup
+            frame_count = 0
+            fps = None
             if self.recorder_node:
+                frame_count = self.recorder_node.frame_count
+                fps = self.recorder_node.fps
                 self.recorder_node.stop_recording()
 
             # Give video writer time to flush
@@ -370,9 +518,24 @@ class VideoRecorderManager:
             if output_path and Path(output_path).exists():
                 file_size = Path(output_path).stat().st_size / (1024 * 1024)  # MB
                 result += f"Video saved: {output_path}\n"
+                
+                result += f"Frame count: {frame_count}\n"
+                
+                # Calculate duration if we have fps and frame count
+                if fps and fps > 0 and frame_count > 0:
+                    duration_seconds = frame_count / fps
+                    minutes = int(duration_seconds // 60)
+                    seconds = int(duration_seconds % 60)
+                    if minutes > 0:
+                        result += f"Duration: {minutes}m {seconds}s\n"
+                    else:
+                        result += f"Duration: {seconds}s\n"
+                
                 result += f"File size: {file_size:.2f} MB\n"
             else:
                 result += f"Output: {self.current_output_path}\n"
+                if frame_count > 0:
+                    result += f"Frame count: {frame_count}\n"
 
             return result
 
@@ -394,8 +557,27 @@ class VideoRecorderManager:
                 params = state.get("params", {})
                 result = "Status: Recording in progress\n"
                 result += f"Camera topic: {params.get('camera_topic', 'unknown')}\n"
-                result += f"FPS: {params.get('fps', 'unknown')}\n"
-                result += f"Resolution: {params.get('image_width', '?')}x{params.get('image_height', '?')}\n"
+                
+                # Get actual FPS from recorder node if available (may be auto-detected)
+                if self.recorder_node and self.recorder_node.video_writer_initialized:
+                    actual_fps = self.recorder_node.fps
+                    result += f"FPS: {actual_fps}\n"
+                else:
+                    result += f"FPS: {params.get('fps', 'Auto-detect (not yet initialized)')}\n"
+                
+                # Get actual resolution from recorder node if available (may be auto-detected)
+                if self.recorder_node and self.recorder_node.video_writer_initialized:
+                    actual_width = self.recorder_node.width
+                    actual_height = self.recorder_node.height
+                    result += f"Resolution: {actual_width}x{actual_height}\n"
+                else:
+                    width = params.get('image_width', '?')
+                    height = params.get('image_height', '?')
+                    if width == '?' or height == '?':
+                        result += f"Resolution: Auto-detect (not yet initialized)\n"
+                    else:
+                        result += f"Resolution: {width}x{height}\n"
+                
                 if self.recorder_node:
                     result += f"Frames recorded: {self.recorder_node.frame_count}\n"
                 return result

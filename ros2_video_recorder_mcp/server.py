@@ -8,8 +8,10 @@ making it a fully standalone solution that requires only the ROS2 environment.
 """
 
 import os
-import atexit
-from mcp.server.fastmcp import FastMCP
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+from dataclasses import dataclass
+from mcp.server.fastmcp import FastMCP, Context
 from .recorder_manager import VideoRecorderManager
 
 
@@ -20,37 +22,47 @@ if BASE_OUTPUT_DIR:
 else:
     VIDEOS_DIR = "videos"
 
-# Global manager instance with default folder path
-manager = VideoRecorderManager(default_folder_path=VIDEOS_DIR)
 
-# Initialize MCP server
-mcp = FastMCP("ros2-video-recorder")
+@dataclass
+class AppContext:
+    """Application context holding the video recorder manager"""
+    manager: VideoRecorderManager
 
 
-def cleanup_on_shutdown():
-    """Cleanup function to run when the server shuts down"""
-    import asyncio
+@asynccontextmanager
+async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+    """
+    Lifespan context manager for proper resource initialization and cleanup.
+
+    This ensures the VideoRecorderManager is properly cleaned up when the MCP server
+    disconnects, not just on process exit. This fixes issues with server refresh
+    where stale ROS 2 state would persist.
+    """
+    # Initialize manager on server startup
+    manager = VideoRecorderManager(default_folder_path=VIDEOS_DIR)
     try:
-        asyncio.run(manager.cleanup())
-    except Exception:
-        pass
+        yield AppContext(manager=manager)
+    finally:
+        # Cleanup on server shutdown (including refresh/reconnect)
+        await manager.cleanup()
 
 
-# Register cleanup function to run on exit
-atexit.register(cleanup_on_shutdown)
+# Initialize MCP server with lifespan
+mcp = FastMCP("ros2-video-recorder", lifespan=app_lifespan)
 
 
 @mcp.tool(description="Start recording video from a ROS2 image topic. Records continuously until stopped (default) or for a specified duration. Videos are saved with timestamps in the filename.")
 async def start_recording(
-    camera_topic: str = "/camera_input",
-    fps: int = 30,
-    image_height: int = 720,
-    image_width: int = 1280,
+    ctx: Context,
+    camera_topic: str,
+    fps: int = None,
+    image_height: int = None,
+    image_width: int = None,
     overlay_timestamp: bool = False,
     folder_path: str = None,
     video_length: int = 0,
-    auto_fps: bool = False,
-    auto_resolution: bool = False,
+    auto_fps: bool = True,
+    auto_resolution: bool = True,
     video_codec: str = "mp4v",
     file_prefix: str = "",
     file_postfix: str = "",
@@ -60,15 +72,15 @@ async def start_recording(
     Start recording video from a ROS2 image topic.
 
     Args:
-        camera_topic: ROS2 topic name for camera images (e.g., /camera/image_raw)
-        fps: Frame rate for recording (frames per second, 1-120)
-        image_height: Image height in pixels
-        image_width: Image width in pixels
+        camera_topic: ROS2 topic name for camera images (e.g., /camera/image_raw) (required)
+        fps: Frame rate for recording (frames per second, 1-120). If None, auto-detects from topic (default: None)
+        image_height: Image height in pixels. If None, auto-detects from first frame (default: None)
+        image_width: Image width in pixels. If None, auto-detects from first frame (default: None)
         overlay_timestamp: Whether to overlay timestamp on video frames
         folder_path: Directory to save recorded videos (optional)
         video_length: Length of each video segment in seconds (0 = continuous recording)
-        auto_fps: Auto-detect topic framerate (overrides fps parameter)
-        auto_resolution: Auto-detect image resolution from topic (overrides image_height and image_width)
+        auto_fps: Auto-detect topic framerate (default: True). Disabled if fps is explicitly set
+        auto_resolution: Auto-detect image resolution from topic (default: True). Disabled if width/height are explicitly set
         video_codec: Video codec to use (e.g., mp4v, h264)
         file_prefix: Prefix for output filenames
         file_postfix: Postfix for output filenames
@@ -77,6 +89,7 @@ async def start_recording(
     Returns:
         Status message indicating success or failure
     """
+    manager = ctx.request_context.lifespan_context.manager
     return await manager.start_recording(
         camera_topic=camera_topic,
         fps=fps,
@@ -95,24 +108,26 @@ async def start_recording(
 
 
 @mcp.tool(description="Stop the current video recording session gracefully")
-async def stop_recording() -> str:
+async def stop_recording(ctx: Context) -> str:
     """
     Stop the current recording.
 
     Returns:
         Status message indicating success or failure, including the path to the saved video
     """
+    manager = ctx.request_context.lifespan_context.manager
     return await manager.stop_recording()
 
 
 @mcp.tool(description="Check if video recording is currently active")
-async def get_recording_status() -> str:
+async def get_recording_status(ctx: Context) -> str:
     """
     Get current recording status.
 
     Returns:
         Status message with details about the recording
     """
+    manager = ctx.request_context.lifespan_context.manager
     return await manager.get_status()
 
 

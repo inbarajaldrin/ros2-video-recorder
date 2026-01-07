@@ -26,6 +26,8 @@ import asyncio
 import argparse
 import sys
 import os
+import atexit
+import signal
 from pathlib import Path
 from .recorder_manager import VideoRecorderManager
 
@@ -56,6 +58,31 @@ async def start_recording_cmd(args):
     default_folder = args.output if args.output else get_default_videos_folder()
     manager = VideoRecorderManager(default_folder_path=default_folder)
 
+    # Flag to signal interruption
+    interrupted = False
+
+    # Register cleanup on exit
+    def cleanup_handler():
+        """Cleanup function called on exit"""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Schedule cleanup in the running loop
+                asyncio.create_task(manager.cleanup())
+            else:
+                asyncio.run(manager.cleanup())
+        except Exception:
+            pass
+
+    atexit.register(cleanup_handler)
+
+    # Handle SIGINT (Ctrl+C) gracefully
+    def signal_handler(sig, frame):
+        nonlocal interrupted
+        interrupted = True
+
+    signal.signal(signal.SIGINT, signal_handler)
+
     result = await manager.start_recording(
         camera_topic=args.camera_topic,
         fps=args.fps,
@@ -69,10 +96,38 @@ async def start_recording_cmd(args):
         video_codec=args.codec,
         file_prefix=args.prefix,
         file_postfix=args.postfix,
-        file_type=args.format
+        file_type=args.format,
+        verbose=args.verbose if hasattr(args, 'verbose') else False
     )
 
     print(result)
+    print("\nRecording in progress. Press Ctrl+C to stop...")
+
+    # Keep the process alive and update display with detected values
+    try:
+        while not interrupted:
+            await asyncio.sleep(0.2)
+
+            # Update display with current values
+            if manager.recorder_node and manager.recorder_node.video_writer_initialized:
+                fps = manager.recorder_node.fps
+                width = manager.recorder_node.width
+                height = manager.recorder_node.height
+                frames = manager.recorder_node.frame_count
+                status_line = f"\rStatus: FPS={fps}, Resolution={width}x{height}, Frames={frames}"
+                print(status_line, end='', flush=True)
+            else:
+                # Still detecting
+                print("\rDetecting FPS and resolution...", end='', flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+    
+    # Cleanup on exit
+    if interrupted:
+        print("\n\nStopping recording...")
+        result = await manager.stop_recording()
+        print(result)
+        await manager.cleanup()
 
 
 async def stop_recording_cmd(args):
@@ -110,7 +165,8 @@ async def record_cmd(args):
         video_codec=args.codec,
         file_prefix=args.prefix,
         file_postfix=args.postfix,
-        file_type=args.format
+        file_type=args.format,
+        verbose=args.verbose if hasattr(args, 'verbose') else False
     )
     print(result)
 
@@ -145,20 +201,20 @@ def main():
     start_parser.add_argument(
         "--fps", "-f",
         type=int,
-        default=30,
-        help="Frame rate (default: 30)"
+        default=None,
+        help="Frame rate (default: auto-detect from topic, typical: 30)"
     )
     start_parser.add_argument(
         "--width", "-w",
         type=int,
-        default=1280,
-        help="Image width (default: 1280)"
+        default=None,
+        help="Image width in pixels (default: auto-detect from first frame, typical: 1280)"
     )
     start_parser.add_argument(
         "--height",
         type=int,
-        default=720,
-        help="Image height (default: 720)"
+        default=None,
+        help="Image height in pixels (default: auto-detect from first frame, typical: 720)"
     )
     start_parser.add_argument(
         "--timestamp",
@@ -205,6 +261,11 @@ def main():
         default="mp4",
         help="Video file format (default: mp4)"
     )
+    start_parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose ROS2 logging"
+    )
     start_parser.set_defaults(func=start_recording_cmd)
 
     # Stop command
@@ -234,20 +295,20 @@ def main():
     record_parser.add_argument(
         "--fps", "-f",
         type=int,
-        default=30,
-        help="Frame rate (default: 30)"
+        default=None,
+        help="Frame rate (default: auto-detect from topic, typical: 30)"
     )
     record_parser.add_argument(
         "--width", "-w",
         type=int,
-        default=1280,
-        help="Image width (default: 1280)"
+        default=None,
+        help="Image width in pixels (default: auto-detect from first frame, typical: 1280)"
     )
     record_parser.add_argument(
         "--height",
         type=int,
-        default=720,
-        help="Image height (default: 720)"
+        default=None,
+        help="Image height in pixels (default: auto-detect from first frame, typical: 720)"
     )
     record_parser.add_argument(
         "--timestamp",
@@ -287,6 +348,11 @@ def main():
         "--format",
         default="mp4",
         help="Video file format (default: mp4)"
+    )
+    record_parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose ROS2 logging"
     )
     record_parser.set_defaults(func=record_cmd)
 
