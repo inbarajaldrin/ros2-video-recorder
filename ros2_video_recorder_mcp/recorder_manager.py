@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 import json
 
 # Import ROS2 dependencies at module level
@@ -53,6 +53,8 @@ class VideoRecorderNode(Node):
             on_values_detected: Optional callback when values are auto-detected
         """
         super().__init__('video_recorder_node')
+        # Set logger level to WARN to suppress INFO messages
+        self.get_logger().set_level(30)  # 30 = WARN level (suppresses INFO)
 
         self.camera_topic = camera_topic
         self.fps = fps
@@ -71,6 +73,8 @@ class VideoRecorderNode(Node):
         self.is_recording = False
         self.lock = threading.Lock()
         self.video_writer_initialized = False
+        self.recording_start_time = None  # Track when recording actually starts (when first frame is written)
+        self.first_frame_written = False  # Track if first frame has been written
 
         # For auto FPS detection
         self.frame_timestamps = []
@@ -79,6 +83,8 @@ class VideoRecorderNode(Node):
         # Event to signal when values are detected (for async waiting)
         self.values_detected_event = None  # Will be set by manager if needed
         self.event_loop = None  # Will be set by manager if needed
+        # Event to signal when first frame is written (for async waiting)
+        self.first_frame_written_event = None  # Will be set by manager if needed
 
         # Subscribe to the camera topic
         self.subscription = self.create_subscription(
@@ -126,7 +132,9 @@ class VideoRecorderNode(Node):
                     self.get_logger().info(f"Auto-detected resolution: {self.width}x{self.height}")
 
                 # Auto-detect FPS if needed (will calculate from first few frames)
-                if self.auto_fps or self.fps is None:
+                fps_ready = False
+                if self.auto_fps and self.fps is None:
+                    # We need to detect FPS - collect frame intervals
                     current_time = datetime.now().timestamp()
                     if self.last_frame_time is not None:
                         frame_interval = current_time - self.last_frame_time
@@ -137,13 +145,21 @@ class VideoRecorderNode(Node):
                                 avg_interval = sum(self.frame_timestamps[-10:]) / len(self.frame_timestamps[-10:])
                                 self.fps = int(round(1.0 / avg_interval))
                                 self.get_logger().info(f"Auto-detected FPS: {self.fps}")
+                                fps_ready = True
                     self.last_frame_time = current_time
 
-                    # Use default FPS if not yet detected
+                    # Only initialize VideoWriter after FPS is detected
+                    # This ensures we use the actual camera FPS, not a default
+                    if not fps_ready:
+                        # Skip this frame - we're still detecting FPS
+                        return
+                else:
+                    # FPS is explicitly set or auto_fps is disabled - we can proceed
                     if self.fps is None:
                         self.fps = 30  # Default fallback
+                    fps_ready = True
 
-                # Initialize video writer now that we have all parameters
+                # Initialize video writer now that we have all parameters (including detected FPS)
                 fourcc = cv2.VideoWriter_fourcc(*self.video_codec)
                 self.video_writer = cv2.VideoWriter(
                     self.output_path,
@@ -156,6 +172,7 @@ class VideoRecorderNode(Node):
                     raise RuntimeError(f"Failed to open video writer for {self.output_path}")
 
                 self.video_writer_initialized = True
+                # Don't set recording_start_time here - wait for first frame to be written
                 self.get_logger().info(f"Video writer initialized: {self.width}x{self.height} @ {self.fps} fps")
                 
                 # Signal that values are detected (thread-safe)
@@ -186,6 +203,13 @@ class VideoRecorderNode(Node):
             # Write frame to video
             with self.lock:
                 if self.video_writer and self.video_writer.isOpened():
+                    # Record start time when first frame is actually written
+                    if not self.first_frame_written:
+                        self.recording_start_time = datetime.now()
+                        self.first_frame_written = True
+                        # Signal that first frame has been written (thread-safe)
+                        if self.first_frame_written_event and self.event_loop:
+                            self.event_loop.call_soon_threadsafe(self.first_frame_written_event.set)
                     self.video_writer.write(frame)
                     self.frame_count += 1
 
@@ -275,7 +299,8 @@ class VideoRecorderManager:
         state = {
             "recording": True,
             "params": params,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "start_time": datetime.now().timestamp()  # Track actual start time for duration calculation
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f)
@@ -310,6 +335,39 @@ class VideoRecorderManager:
         """Check if recording is currently active"""
         state = self._load_state()
         return bool(state and state.get("recording")) and self.recorder_node is not None
+
+    def _get_video_metadata(self, video_path: Path) -> Tuple[Optional[float], Optional[int], Optional[float]]:
+        """
+        Read actual video file metadata to get FPS, frame count, and duration.
+        This is the source of truth - what's actually in the file.
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            Tuple of (duration_seconds, frame_count, fps) or (None, None, None) if error
+        """
+        try:
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                return None, None, None
+            
+            # Get metadata from the actual video file
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            cap.release()
+            
+            # Calculate duration from file metadata
+            if fps > 0 and frame_count > 0:
+                duration_seconds = frame_count / fps
+                return duration_seconds, frame_count, fps
+            else:
+                return None, frame_count if frame_count > 0 else None, fps if fps > 0 else None
+                
+        except Exception as e:
+            # Silently fail - return None values
+            return None, None, None
 
     async def start_recording(
         self,
@@ -369,13 +427,12 @@ class VideoRecorderManager:
             filename = self._generate_filename(file_prefix, file_postfix, file_type)
             self.current_output_path = str(Path(folder_path) / filename)
 
-            # Create event for signaling when values are detected (if auto-detection is enabled)
+            # Create events for signaling when values are detected and when first frame is written
             values_detected_event = None
+            first_frame_written_event = asyncio.Event()  # Always create this - we need to wait for first frame
             if use_auto_fps or use_auto_resolution:
                 values_detected_event = asyncio.Event()
-                event_loop = asyncio.get_event_loop()
-            else:
-                event_loop = None
+            event_loop = asyncio.get_event_loop()
 
             # Create and start the recorder node
             self.recorder_node = VideoRecorderNode(
@@ -391,10 +448,11 @@ class VideoRecorderManager:
                 on_values_detected=self._update_state_with_detected_values
             )
             
-            # Set event and loop in node for signaling
+            # Set events and loop in node for signaling
+            self.recorder_node.first_frame_written_event = first_frame_written_event
+            self.recorder_node.event_loop = event_loop
             if values_detected_event:
                 self.recorder_node.values_detected_event = values_detected_event
-                self.recorder_node.event_loop = event_loop
 
             # Start executor thread if not already running
             self._start_executor_thread()
@@ -448,6 +506,17 @@ class VideoRecorderManager:
                 # Just give subscription time to connect
                 await asyncio.sleep(0.4)
 
+            # Wait for first frame to be written before returning
+            # This ensures recording has actually started and no operation data is lost
+            if not self.recorder_node.first_frame_written:
+                try:
+                    # Wait for first frame with timeout (should happen quickly after VideoWriter is initialized)
+                    await asyncio.wait_for(first_frame_written_event.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    # Timeout - check if first frame was written anyway
+                    if not self.recorder_node.first_frame_written:
+                        return "Error: Timeout waiting for first frame. Check that the camera topic is publishing images."
+
             result = "Recording started successfully!\n"
             result += f"Output file: {self.current_output_path}\n"
             result += f"Camera topic: {camera_topic}\n"
@@ -490,13 +559,41 @@ class VideoRecorderManager:
             return "No recording in progress."
 
         try:
-            # Capture frame count and fps before cleanup
+            # Capture frame count, fps, and start time before cleanup
             frame_count = 0
             fps = None
+            recording_start_time = None
             if self.recorder_node:
                 frame_count = self.recorder_node.frame_count
                 fps = self.recorder_node.fps
+                recording_start_time = self.recorder_node.recording_start_time
                 self.recorder_node.stop_recording()
+
+            # Load state to get output path and start time (before cleanup)
+            state = self._load_state()
+            output_path = None
+            start_time = None
+            if state:
+                output_path = state.get("params", {}).get("output_path")
+                start_time = state.get("start_time")
+            
+            # Use node's start time if available (more accurate), otherwise use state
+            if not recording_start_time and start_time:
+                recording_start_time = datetime.fromtimestamp(start_time)
+            
+            # Calculate actual stop time from video file duration (most accurate)
+            # This ensures stop time matches the actual video content, not when stop_recording() was called
+            stop_time = None
+            if output_path and Path(output_path).exists():
+                file_duration, file_frame_count, file_fps = self._get_video_metadata(Path(output_path))
+                if recording_start_time and file_duration:
+                    # Calculate stop time based on start time + actual video duration
+                    from datetime import timedelta
+                    stop_time = recording_start_time + timedelta(seconds=file_duration)
+            
+            # Fallback to current time if we can't calculate from video
+            if stop_time is None:
+                stop_time = datetime.now()
 
             # Give video writer time to flush
             await asyncio.sleep(0.5)
@@ -506,12 +603,6 @@ class VideoRecorderManager:
                 self.executor.remove_node(self.recorder_node)
             self.recorder_node = None
 
-            # Load state to get output path
-            state = self._load_state()
-            output_path = None
-            if state:
-                output_path = state.get("params", {}).get("output_path")
-
             self._clear_state()
 
             result = "Recording stopped successfully.\n"
@@ -519,23 +610,58 @@ class VideoRecorderManager:
                 file_size = Path(output_path).stat().st_size / (1024 * 1024)  # MB
                 result += f"Video saved: {output_path}\n"
                 
-                result += f"Frame count: {frame_count}\n"
+                # Read actual metadata from the video file (source of truth)
+                file_duration, file_frame_count, file_fps = self._get_video_metadata(Path(output_path))
                 
-                # Calculate duration if we have fps and frame count
-                if fps and fps > 0 and frame_count > 0:
+                # Use file metadata if available, otherwise fall back to tracked values
+                if file_frame_count is not None:
+                    result += f"Frame count: {file_frame_count}\n"
+                elif frame_count > 0:
+                    result += f"Frame count: {frame_count} (tracked, file metadata unavailable)\n"
+                
+                if file_fps is not None:
+                    result += f"FPS: {file_fps:.2f}\n"
+                elif fps is not None:
+                    result += f"FPS: {fps} (tracked, file metadata unavailable)\n"
+                
+                # Calculate duration from file metadata (most accurate)
+                if file_duration is not None:
+                    duration_seconds = file_duration
+                    minutes = int(duration_seconds // 60)
+                    seconds_remainder = duration_seconds % 60
+                    if minutes > 0:
+                        if seconds_remainder == int(seconds_remainder):
+                            result += f"Duration: {minutes}m {int(seconds_remainder)}s\n"
+                        else:
+                            result += f"Duration: {minutes}m {seconds_remainder:.1f}s\n"
+                    else:
+                        if seconds_remainder == int(seconds_remainder):
+                            result += f"Duration: {int(seconds_remainder)}s\n"
+                        else:
+                            result += f"Duration: {seconds_remainder:.1f}s\n"
+                # Fallback to calculated duration if file metadata unavailable
+                elif fps and fps > 0 and frame_count > 0:
                     duration_seconds = frame_count / fps
                     minutes = int(duration_seconds // 60)
                     seconds = int(duration_seconds % 60)
                     if minutes > 0:
-                        result += f"Duration: {minutes}m {seconds}s\n"
+                        result += f"Duration: {minutes}m {seconds}s (calculated from tracked values)\n"
                     else:
-                        result += f"Duration: {seconds}s\n"
+                        result += f"Duration: {seconds}s (calculated from tracked values)\n"
                 
                 result += f"File size: {file_size:.2f} MB\n"
+                
+                # Add start and end timestamps
+                if recording_start_time:
+                    result += f"Recording started: {recording_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                result += f"Recording stopped: {stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             else:
                 result += f"Output: {self.current_output_path}\n"
                 if frame_count > 0:
                     result += f"Frame count: {frame_count}\n"
+                if recording_start_time:
+                    result += f"Recording started: {recording_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                result += f"Recording stopped: {stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
 
             return result
 

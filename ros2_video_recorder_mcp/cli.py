@@ -96,8 +96,7 @@ async def start_recording_cmd(args):
         video_codec=args.codec,
         file_prefix=args.prefix,
         file_postfix=args.postfix,
-        file_type=args.format,
-        verbose=args.verbose if hasattr(args, 'verbose') else False
+        file_type=args.format
     )
 
     print(result)
@@ -165,8 +164,7 @@ async def record_cmd(args):
         video_codec=args.codec,
         file_prefix=args.prefix,
         file_postfix=args.postfix,
-        file_type=args.format,
-        verbose=args.verbose if hasattr(args, 'verbose') else False
+        file_type=args.format
     )
     print(result)
 
