@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Callable, Tuple
+from typing import Optional, Callable, Tuple, Union, List
 import json
 
 # Import ROS2 dependencies at module level
@@ -241,8 +241,10 @@ class VideoRecorderManager:
         self.rclpy_initialized = False
         self.executor = None
         self.executor_thread = None
-        self.recorder_node = None
-        self.current_output_path = None
+        # Support multiple recorder nodes - dict keyed by camera topic
+        self.recorder_nodes = {}
+        # Track output paths for each topic
+        self.output_paths = {}
 
         # State file for tracking
         self.state_dir = Path("/tmp/ros2_video_recorder")
@@ -280,7 +282,7 @@ class VideoRecorderManager:
 
     def _executor_spin(self):
         """Run the executor spin loop"""
-        while self.rclpy_initialized and self.recorder_node is not None:
+        while self.rclpy_initialized and len(self.recorder_nodes) > 0:
             try:
                 self.executor.spin_once(timeout_sec=0.1)
             except Exception as e:
@@ -294,27 +296,33 @@ class VideoRecorderManager:
         filename = f"{file_prefix}{timestamp}{file_postfix}.{file_type}"
         return filename
 
-    def _save_state(self, params: dict):
-        """Save recording state to file"""
-        state = {
+    def _save_state(self, camera_topic: str, params: dict):
+        """Save recording state to file for a specific topic"""
+        # Load existing state
+        state = self._load_state() or {"recordings": {}}
+
+        # Add or update this recording
+        state["recordings"][camera_topic] = {
             "recording": True,
             "params": params,
             "timestamp": datetime.now().isoformat(),
             "start_time": datetime.now().timestamp()  # Track actual start time for duration calculation
         }
+
         with open(self.state_file, "w") as f:
             json.dump(state, f)
 
-    def _update_state_with_detected_values(self):
+    def _update_state_with_detected_values(self, camera_topic: str):
         """Update state file with auto-detected values from recorder node"""
-        if self.recorder_node and self.recorder_node.video_writer_initialized:
+        recorder_node = self.recorder_nodes.get(camera_topic)
+        if recorder_node and recorder_node.video_writer_initialized:
             state = self._load_state()
-            if state:
-                params = state.get("params", {})
-                params["fps"] = self.recorder_node.fps
-                params["image_width"] = self.recorder_node.width
-                params["image_height"] = self.recorder_node.height
-                self._save_state(params)
+            if state and camera_topic in state.get("recordings", {}):
+                params = state["recordings"][camera_topic].get("params", {})
+                params["fps"] = recorder_node.fps
+                params["image_width"] = recorder_node.width
+                params["image_height"] = recorder_node.height
+                self._save_state(camera_topic, params)
 
     def _load_state(self) -> Optional[dict]:
         """Load recording state from file"""
@@ -326,15 +334,53 @@ class VideoRecorderManager:
         except (json.JSONDecodeError, FileNotFoundError):
             return None
 
-    def _clear_state(self):
-        """Clear the state file"""
-        if self.state_file.exists():
-            self.state_file.unlink()
+    def _clear_state(self, camera_topic: Optional[str] = None):
+        """Clear the state file or remove a specific recording from state
 
-    def is_recording(self) -> bool:
-        """Check if recording is currently active"""
+        Args:
+            camera_topic: If provided, remove only this topic's state. If None, clear all.
+        """
+        if camera_topic is None:
+            # Clear entire state file
+            if self.state_file.exists():
+                self.state_file.unlink()
+        else:
+            # Remove specific recording from state
+            state = self._load_state()
+            if state and "recordings" in state and camera_topic in state["recordings"]:
+                del state["recordings"][camera_topic]
+                # If no recordings left, delete the file
+                if not state["recordings"]:
+                    if self.state_file.exists():
+                        self.state_file.unlink()
+                else:
+                    # Otherwise save the updated state
+                    with open(self.state_file, "w") as f:
+                        json.dump(state, f)
+
+    def is_recording(self, camera_topic: Optional[str] = None) -> bool:
+        """Check if recording is currently active
+
+        Args:
+            camera_topic: If provided, check if this specific topic is recording.
+                         If None, check if any recording is active.
+
+        Returns:
+            True if recording(s) active, False otherwise
+        """
         state = self._load_state()
-        return bool(state and state.get("recording")) and self.recorder_node is not None
+        if not state or "recordings" not in state:
+            return False
+
+        if camera_topic is not None:
+            # Check specific topic
+            return (camera_topic in state["recordings"] and
+                    state["recordings"][camera_topic].get("recording", False) and
+                    camera_topic in self.recorder_nodes)
+        else:
+            # Check if any recording is active
+            return (any(rec.get("recording", False) for rec in state["recordings"].values()) and
+                    len(self.recorder_nodes) > 0)
 
     def _get_video_metadata(self, video_path: Path) -> Tuple[Optional[float], Optional[int], Optional[float]]:
         """
@@ -369,46 +415,31 @@ class VideoRecorderManager:
             # Silently fail - return None values
             return None, None, None
 
-    async def start_recording(
+    async def _start_single_recording(
         self,
-        camera_topic: str = "/camera_input",
-        fps: Optional[int] = None,
-        image_height: Optional[int] = None,
-        image_width: Optional[int] = None,
-        overlay_timestamp: bool = False,
-        folder_path: Optional[str] = None,
-        video_length: int = 0,
-        auto_fps: bool = True,
-        auto_resolution: bool = True,
-        video_codec: str = "mp4v",
-        file_prefix: str = "",
-        file_postfix: str = "",
-        file_type: str = "mp4"
+        camera_topic: str,
+        fps: Optional[int],
+        image_height: Optional[int],
+        image_width: Optional[int],
+        overlay_timestamp: bool,
+        folder_path: Optional[str],
+        video_length: int,
+        auto_fps: bool,
+        auto_resolution: bool,
+        video_codec: str,
+        file_prefix: str,
+        file_postfix: str,
+        file_type: str
     ) -> str:
         """
-        Start video recording from a ROS2 camera topic
-
-        Args:
-            camera_topic: ROS2 topic name for camera images
-            fps: Frame rate for recording (1-120). If None, auto-detects from topic (default: None)
-            image_height: Image height in pixels. If None, auto-detects from first frame (default: None)
-            image_width: Image width in pixels. If None, auto-detects from first frame (default: None)
-            overlay_timestamp: Whether to overlay timestamp on frames
-            folder_path: Directory to save videos
-            video_length: Length of video segment in seconds (0 = continuous)
-            auto_fps: Auto-detect topic framerate (default: True). Disabled if fps is explicitly set
-            auto_resolution: Auto-detect image resolution (default: True). Disabled if width/height are explicitly set
-            video_codec: Video codec to use (default: mp4v)
-            file_prefix: Prefix for output filename
-            file_postfix: Postfix for output filename
-            file_type: Video file extension
+        Internal method to start recording for a single camera topic.
 
         Returns:
             Status message indicating success or failure
         """
-
-        if self.is_recording():
-            return "Error: Recording is already in progress. Stop current recording first."
+        # Check if this specific topic is already being recorded
+        if self.is_recording(camera_topic):
+            return f"Error: Recording is already in progress for topic '{camera_topic}'. Stop it first before starting a new recording on the same topic."
 
         try:
             # Initialize ROS2
@@ -425,7 +456,8 @@ class VideoRecorderManager:
 
             # Generate output filename
             filename = self._generate_filename(file_prefix, file_postfix, file_type)
-            self.current_output_path = str(Path(folder_path) / filename)
+            output_path = str(Path(folder_path) / filename)
+            self.output_paths[camera_topic] = output_path
 
             # Create events for signaling when values are detected and when first frame is written
             values_detected_event = None
@@ -434,32 +466,39 @@ class VideoRecorderManager:
                 values_detected_event = asyncio.Event()
             event_loop = asyncio.get_event_loop()
 
+            # Create callback that passes camera_topic to update function
+            def on_values_detected():
+                self._update_state_with_detected_values(camera_topic)
+
             # Create and start the recorder node
-            self.recorder_node = VideoRecorderNode(
+            recorder_node = VideoRecorderNode(
                 camera_topic=camera_topic,
                 fps=fps,
                 width=image_width,
                 height=image_height,
                 overlay_timestamp=overlay_timestamp,
-                output_path=self.current_output_path,
+                output_path=output_path,
                 video_codec=video_codec,
                 auto_fps=use_auto_fps,
                 auto_resolution=use_auto_resolution,
-                on_values_detected=self._update_state_with_detected_values
+                on_values_detected=on_values_detected
             )
-            
+
             # Set events and loop in node for signaling
-            self.recorder_node.first_frame_written_event = first_frame_written_event
-            self.recorder_node.event_loop = event_loop
+            recorder_node.first_frame_written_event = first_frame_written_event
+            recorder_node.event_loop = event_loop
             if values_detected_event:
-                self.recorder_node.values_detected_event = values_detected_event
+                recorder_node.values_detected_event = values_detected_event
+
+            # Store the recorder node
+            self.recorder_nodes[camera_topic] = recorder_node
 
             # Start executor thread if not already running
             self._start_executor_thread()
 
             # Add node to executor
             if self.executor:
-                self.executor.add_node(self.recorder_node)
+                self.executor.add_node(recorder_node)
 
             # Give executor a moment to start processing (allows first message to arrive)
             await asyncio.sleep(0.05)
@@ -476,80 +515,163 @@ class VideoRecorderManager:
                 "file_prefix": file_prefix,
                 "file_postfix": file_postfix,
                 "file_type": file_type,
-                "output_path": self.current_output_path,
+                "output_path": output_path,
             }
-            self._save_state(params)
+            self._save_state(camera_topic, params)
 
             # Wait for first frame to be received and values to be detected (if auto-detection is enabled)
             values_detected = False
             if use_auto_fps or use_auto_resolution:
                 # Check if already detected (might have happened during the sleep above)
-                if self.recorder_node and self.recorder_node.video_writer_initialized:
+                if recorder_node and recorder_node.video_writer_initialized:
                     values_detected = True
-                    self._update_state_with_detected_values()
+                    self._update_state_with_detected_values(camera_topic)
                 elif not values_detected_event.is_set():
                     try:
                         # Wait for event with 5 second timeout
                         await asyncio.wait_for(values_detected_event.wait(), timeout=5.0)
                         values_detected = True
-                        self._update_state_with_detected_values()
+                        self._update_state_with_detected_values(camera_topic)
                     except asyncio.TimeoutError:
                         # Timeout - check if detection happened anyway (event might have been set)
-                        if self.recorder_node and self.recorder_node.video_writer_initialized:
+                        if recorder_node and recorder_node.video_writer_initialized:
                             values_detected = True
-                            self._update_state_with_detected_values()
+                            self._update_state_with_detected_values(camera_topic)
                 else:
                     # Event was already set
                     values_detected = True
-                    self._update_state_with_detected_values()
+                    self._update_state_with_detected_values(camera_topic)
             else:
                 # Just give subscription time to connect
                 await asyncio.sleep(0.4)
 
             # Wait for first frame to be written before returning
             # This ensures recording has actually started and no operation data is lost
-            if not self.recorder_node.first_frame_written:
+            if not recorder_node.first_frame_written:
                 try:
                     # Wait for first frame with timeout (should happen quickly after VideoWriter is initialized)
                     await asyncio.wait_for(first_frame_written_event.wait(), timeout=10.0)
                 except asyncio.TimeoutError:
                     # Timeout - check if first frame was written anyway
-                    if not self.recorder_node.first_frame_written:
+                    if not recorder_node.first_frame_written:
+                        # Clean up this failed recording
+                        if self.executor:
+                            self.executor.remove_node(recorder_node)
+                        del self.recorder_nodes[camera_topic]
+                        del self.output_paths[camera_topic]
+                        self._clear_state(camera_topic)
                         return "Error: Timeout waiting for first frame. Check that the camera topic is publishing images."
 
             result = "Recording started successfully!\n"
-            result += f"Output file: {self.current_output_path}\n"
+            result += f"Output file: {output_path}\n"
             result += f"Camera topic: {camera_topic}\n"
-            
+
             # Show actual FPS (detected or set)
-            if values_detected and self.recorder_node:
-                result += f"FPS: {self.recorder_node.fps}\n"
+            if values_detected and recorder_node:
+                result += f"FPS: {recorder_node.fps}\n"
             elif fps is not None:
                 result += f"FPS: {fps}\n"
             else:
                 result += f"FPS: Auto-detect (detecting...)\n"
-            
+
             # Show actual resolution (detected or set)
-            if values_detected and self.recorder_node:
-                result += f"Resolution: {self.recorder_node.width}x{self.recorder_node.height}\n"
+            if values_detected and recorder_node:
+                result += f"Resolution: {recorder_node.width}x{recorder_node.height}\n"
             elif image_width is not None and image_height is not None:
                 result += f"Resolution: {image_width}x{image_height}\n"
             else:
                 result += f"Resolution: Auto-detect (detecting...)\n"
-            
+
             result += f"Overlay timestamp: {overlay_timestamp}\n"
             result += f"Video length: {'continuous' if video_length == 0 else f'{video_length} seconds'}\n"
 
             return result
 
         except Exception as e:
-            self._clear_state()
-            self.recorder_node = None
+            # Clean up this recording on error
+            self._clear_state(camera_topic)
+            if camera_topic in self.recorder_nodes:
+                del self.recorder_nodes[camera_topic]
+            if camera_topic in self.output_paths:
+                del self.output_paths[camera_topic]
             return f"Error: Failed to start recording. {str(e)}"
 
-    async def stop_recording(self) -> str:
+    async def start_recording(
+        self,
+        camera_topic: Union[str, List[str]] = "/camera_input",
+        fps: Optional[int] = None,
+        image_height: Optional[int] = None,
+        image_width: Optional[int] = None,
+        overlay_timestamp: bool = False,
+        folder_path: Optional[str] = None,
+        video_length: int = 0,
+        auto_fps: bool = True,
+        auto_resolution: bool = True,
+        video_codec: str = "mp4v",
+        file_prefix: str = "",
+        file_postfix: str = "",
+        file_type: str = "mp4"
+    ) -> str:
         """
-        Stop the current recording
+        Start video recording from one or more ROS2 camera topics
+
+        Args:
+            camera_topic: ROS2 topic name(s) for camera images. Can be a single string or a list of strings.
+            fps: Frame rate for recording (1-120). If None, auto-detects from topic (default: None)
+            image_height: Image height in pixels. If None, auto-detects from first frame (default: None)
+            image_width: Image width in pixels. If None, auto-detects from first frame (default: None)
+            overlay_timestamp: Whether to overlay timestamp on frames
+            folder_path: Directory to save videos
+            video_length: Length of video segment in seconds (0 = continuous)
+            auto_fps: Auto-detect topic framerate (default: True). Disabled if fps is explicitly set
+            auto_resolution: Auto-detect image resolution (default: True). Disabled if width/height are explicitly set
+            video_codec: Video codec to use (default: mp4v)
+            file_prefix: Prefix for output filename
+            file_postfix: Postfix for output filename
+            file_type: Video file extension
+
+        Returns:
+            Status message indicating success or failure for all topics
+        """
+        # Handle both single topic and list of topics
+        topics = [camera_topic] if isinstance(camera_topic, str) else camera_topic
+
+        if not topics:
+            return "Error: No camera topics specified."
+
+        # Start recording for each topic
+        results = []
+        for topic in topics:
+            result = await self._start_single_recording(
+                camera_topic=topic,
+                fps=fps,
+                image_height=image_height,
+                image_width=image_width,
+                overlay_timestamp=overlay_timestamp,
+                folder_path=folder_path,
+                video_length=video_length,
+                auto_fps=auto_fps,
+                auto_resolution=auto_resolution,
+                video_codec=video_codec,
+                file_prefix=file_prefix,
+                file_postfix=file_postfix,
+                file_type=file_type
+            )
+            results.append(result)
+
+        # Return combined results
+        if len(results) == 1:
+            return results[0]
+        else:
+            return "\n---\n".join(results)
+
+    async def stop_recording(self, camera_topic: Optional[str] = None) -> str:
+        """
+        Stop the current recording(s)
+
+        Args:
+            camera_topic: If provided, stop only this topic's recording.
+                         If None, stop all active recordings.
 
         Returns:
             Status message indicating success or failure
@@ -558,158 +680,195 @@ class VideoRecorderManager:
         if not self.is_recording():
             return "No recording in progress."
 
-        try:
-            # Capture frame count, fps, and start time before cleanup
-            frame_count = 0
-            fps = None
-            recording_start_time = None
-            if self.recorder_node:
-                frame_count = self.recorder_node.frame_count
-                fps = self.recorder_node.fps
-                recording_start_time = self.recorder_node.recording_start_time
-                self.recorder_node.stop_recording()
+        # Determine which topics to stop
+        topics_to_stop = []
+        if camera_topic is not None:
+            if not self.is_recording(camera_topic):
+                return f"No recording in progress for topic '{camera_topic}'."
+            topics_to_stop = [camera_topic]
+        else:
+            # Stop all recordings
+            topics_to_stop = list(self.recorder_nodes.keys())
 
-            # Load state to get output path and start time (before cleanup)
-            state = self._load_state()
-            output_path = None
-            start_time = None
-            if state:
-                output_path = state.get("params", {}).get("output_path")
-                start_time = state.get("start_time")
-            
-            # Use node's start time if available (more accurate), otherwise use state
-            if not recording_start_time and start_time:
-                recording_start_time = datetime.fromtimestamp(start_time)
-            
-            # Calculate actual stop time from video file duration (most accurate)
-            # This ensures stop time matches the actual video content, not when stop_recording() was called
-            stop_time = None
-            if output_path and Path(output_path).exists():
-                file_duration, file_frame_count, file_fps = self._get_video_metadata(Path(output_path))
-                if recording_start_time and file_duration:
-                    # Calculate stop time based on start time + actual video duration
-                    from datetime import timedelta
-                    stop_time = recording_start_time + timedelta(seconds=file_duration)
-            
-            # Fallback to current time if we can't calculate from video
-            if stop_time is None:
-                stop_time = datetime.now()
+        if not topics_to_stop:
+            return "No recording in progress."
 
-            # Give video writer time to flush
-            await asyncio.sleep(0.5)
+        results = []
 
-            # Clean up
-            if self.executor and self.recorder_node:
-                self.executor.remove_node(self.recorder_node)
-            self.recorder_node = None
+        for topic in topics_to_stop:
+            try:
+                recorder_node = self.recorder_nodes.get(topic)
+                if not recorder_node:
+                    continue
 
-            self._clear_state()
+                # Capture frame count, fps, and start time before cleanup
+                frame_count = recorder_node.frame_count
+                fps = recorder_node.fps
+                recording_start_time = recorder_node.recording_start_time
+                recorder_node.stop_recording()
 
-            result = "Recording stopped successfully.\n"
-            if output_path and Path(output_path).exists():
-                file_size = Path(output_path).stat().st_size / (1024 * 1024)  # MB
-                result += f"Video saved: {output_path}\n"
-                
-                # Read actual metadata from the video file (source of truth)
-                file_duration, file_frame_count, file_fps = self._get_video_metadata(Path(output_path))
-                
-                # Use file metadata if available, otherwise fall back to tracked values
-                if file_frame_count is not None:
-                    result += f"Frame count: {file_frame_count}\n"
-                elif frame_count > 0:
-                    result += f"Frame count: {frame_count} (tracked, file metadata unavailable)\n"
-                
-                if file_fps is not None:
-                    result += f"FPS: {file_fps:.2f}\n"
-                elif fps is not None:
-                    result += f"FPS: {fps} (tracked, file metadata unavailable)\n"
-                
-                # Calculate duration from file metadata (most accurate)
-                if file_duration is not None:
-                    duration_seconds = file_duration
-                    minutes = int(duration_seconds // 60)
-                    seconds_remainder = duration_seconds % 60
-                    if minutes > 0:
-                        if seconds_remainder == int(seconds_remainder):
-                            result += f"Duration: {minutes}m {int(seconds_remainder)}s\n"
+                # Load state to get output path and start time (before cleanup)
+                state = self._load_state()
+                output_path = None
+                start_time = None
+                if state and "recordings" in state and topic in state["recordings"]:
+                    rec_state = state["recordings"][topic]
+                    output_path = rec_state.get("params", {}).get("output_path")
+                    start_time = rec_state.get("start_time")
+
+                # Use node's start time if available (more accurate), otherwise use state
+                if not recording_start_time and start_time:
+                    recording_start_time = datetime.fromtimestamp(start_time)
+
+                # Calculate actual stop time from video file duration (most accurate)
+                # This ensures stop time matches the actual video content, not when stop_recording() was called
+                stop_time = None
+                if output_path and Path(output_path).exists():
+                    file_duration, file_frame_count, file_fps = self._get_video_metadata(Path(output_path))
+                    if recording_start_time and file_duration:
+                        # Calculate stop time based on start time + actual video duration
+                        from datetime import timedelta
+                        stop_time = recording_start_time + timedelta(seconds=file_duration)
+
+                # Fallback to current time if we can't calculate from video
+                if stop_time is None:
+                    stop_time = datetime.now()
+
+                # Give video writer time to flush
+                await asyncio.sleep(0.5)
+
+                # Clean up
+                if self.executor and recorder_node:
+                    self.executor.remove_node(recorder_node)
+                del self.recorder_nodes[topic]
+                if topic in self.output_paths:
+                    del self.output_paths[topic]
+
+                self._clear_state(topic)
+
+                result = f"Recording stopped successfully for topic '{topic}'.\n"
+                if output_path and Path(output_path).exists():
+                    file_size = Path(output_path).stat().st_size / (1024 * 1024)  # MB
+                    result += f"Video saved: {output_path}\n"
+
+                    # Read actual metadata from the video file (source of truth)
+                    file_duration, file_frame_count, file_fps = self._get_video_metadata(Path(output_path))
+
+                    # Use file metadata if available, otherwise fall back to tracked values
+                    if file_frame_count is not None:
+                        result += f"Frame count: {file_frame_count}\n"
+                    elif frame_count > 0:
+                        result += f"Frame count: {frame_count} (tracked, file metadata unavailable)\n"
+
+                    if file_fps is not None:
+                        result += f"FPS: {file_fps:.2f}\n"
+                    elif fps is not None:
+                        result += f"FPS: {fps} (tracked, file metadata unavailable)\n"
+
+                    # Calculate duration from file metadata (most accurate)
+                    if file_duration is not None:
+                        duration_seconds = file_duration
+                        minutes = int(duration_seconds // 60)
+                        seconds_remainder = duration_seconds % 60
+                        if minutes > 0:
+                            if seconds_remainder == int(seconds_remainder):
+                                result += f"Duration: {minutes}m {int(seconds_remainder)}s\n"
+                            else:
+                                result += f"Duration: {minutes}m {seconds_remainder:.1f}s\n"
                         else:
-                            result += f"Duration: {minutes}m {seconds_remainder:.1f}s\n"
-                    else:
-                        if seconds_remainder == int(seconds_remainder):
-                            result += f"Duration: {int(seconds_remainder)}s\n"
+                            if seconds_remainder == int(seconds_remainder):
+                                result += f"Duration: {int(seconds_remainder)}s\n"
+                            else:
+                                result += f"Duration: {seconds_remainder:.1f}s\n"
+                    # Fallback to calculated duration if file metadata unavailable
+                    elif fps and fps > 0 and frame_count > 0:
+                        duration_seconds = frame_count / fps
+                        minutes = int(duration_seconds // 60)
+                        seconds = int(duration_seconds % 60)
+                        if minutes > 0:
+                            result += f"Duration: {minutes}m {seconds}s (calculated from tracked values)\n"
                         else:
-                            result += f"Duration: {seconds_remainder:.1f}s\n"
-                # Fallback to calculated duration if file metadata unavailable
-                elif fps and fps > 0 and frame_count > 0:
-                    duration_seconds = frame_count / fps
-                    minutes = int(duration_seconds // 60)
-                    seconds = int(duration_seconds % 60)
-                    if minutes > 0:
-                        result += f"Duration: {minutes}m {seconds}s (calculated from tracked values)\n"
-                    else:
-                        result += f"Duration: {seconds}s (calculated from tracked values)\n"
-                
-                result += f"File size: {file_size:.2f} MB\n"
-                
-                # Add start and end timestamps
-                if recording_start_time:
-                    result += f"Recording started: {recording_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                result += f"Recording stopped: {stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            else:
-                result += f"Output: {self.current_output_path}\n"
-                if frame_count > 0:
-                    result += f"Frame count: {frame_count}\n"
-                if recording_start_time:
-                    result += f"Recording started: {recording_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                result += f"Recording stopped: {stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            result += f"Duration: {seconds}s (calculated from tracked values)\n"
 
-            return result
+                    result += f"File size: {file_size:.2f} MB\n"
 
-        except Exception as e:
-            self._clear_state()
-            self.recorder_node = None
-            return f"Error stopping recording: {str(e)}"
+                    # Add start and end timestamps
+                    if recording_start_time:
+                        result += f"Recording started: {recording_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    result += f"Recording stopped: {stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                else:
+                    result += f"Output: {output_path or 'unknown'}\n"
+                    if frame_count > 0:
+                        result += f"Frame count: {frame_count}\n"
+                    if recording_start_time:
+                        result += f"Recording started: {recording_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    result += f"Recording stopped: {stop_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+
+                results.append(result)
+
+            except Exception as e:
+                # Clean up this recording on error
+                self._clear_state(topic)
+                if topic in self.recorder_nodes:
+                    del self.recorder_nodes[topic]
+                if topic in self.output_paths:
+                    del self.output_paths[topic]
+                results.append(f"Error stopping recording for topic '{topic}': {str(e)}\n")
+
+        return "\n".join(results)
 
     async def get_status(self) -> str:
         """
-        Get current recording status
+        Get current recording status for all active recordings
 
         Returns:
-            Status message with details
+            Status message with details for all recordings
         """
-        if self.is_recording():
-            state = self._load_state()
-            if state:
-                params = state.get("params", {})
-                result = "Status: Recording in progress\n"
-                result += f"Camera topic: {params.get('camera_topic', 'unknown')}\n"
-                
-                # Get actual FPS from recorder node if available (may be auto-detected)
-                if self.recorder_node and self.recorder_node.video_writer_initialized:
-                    actual_fps = self.recorder_node.fps
-                    result += f"FPS: {actual_fps}\n"
-                else:
-                    result += f"FPS: {params.get('fps', 'Auto-detect (not yet initialized)')}\n"
-                
-                # Get actual resolution from recorder node if available (may be auto-detected)
-                if self.recorder_node and self.recorder_node.video_writer_initialized:
-                    actual_width = self.recorder_node.width
-                    actual_height = self.recorder_node.height
-                    result += f"Resolution: {actual_width}x{actual_height}\n"
-                else:
-                    width = params.get('image_width', '?')
-                    height = params.get('image_height', '?')
-                    if width == '?' or height == '?':
-                        result += f"Resolution: Auto-detect (not yet initialized)\n"
-                    else:
-                        result += f"Resolution: {width}x{height}\n"
-                
-                if self.recorder_node:
-                    result += f"Frames recorded: {self.recorder_node.frame_count}\n"
-                return result
-            return "Status: Recording in progress"
-        else:
+        if not self.is_recording():
             return "Status: Not recording"
+
+        state = self._load_state()
+        if not state or "recordings" not in state or not state["recordings"]:
+            return "Status: Not recording"
+
+        results = []
+        active_count = len(self.recorder_nodes)
+        results.append(f"Status: {active_count} recording(s) in progress\n")
+
+        for topic, recorder_node in self.recorder_nodes.items():
+            rec_state = state["recordings"].get(topic, {})
+            params = rec_state.get("params", {})
+
+            result = f"Camera topic: {topic}\n"
+
+            # Get actual FPS from recorder node if available (may be auto-detected)
+            if recorder_node and recorder_node.video_writer_initialized:
+                actual_fps = recorder_node.fps
+                result += f"  FPS: {actual_fps}\n"
+            else:
+                result += f"  FPS: {params.get('fps', 'Auto-detect (not yet initialized)')}\n"
+
+            # Get actual resolution from recorder node if available (may be auto-detected)
+            if recorder_node and recorder_node.video_writer_initialized:
+                actual_width = recorder_node.width
+                actual_height = recorder_node.height
+                result += f"  Resolution: {actual_width}x{actual_height}\n"
+            else:
+                width = params.get('image_width', '?')
+                height = params.get('image_height', '?')
+                if width == '?' or height == '?':
+                    result += f"  Resolution: Auto-detect (not yet initialized)\n"
+                else:
+                    result += f"  Resolution: {width}x{height}\n"
+
+            if recorder_node:
+                result += f"  Frames recorded: {recorder_node.frame_count}\n"
+
+            result += f"  Output: {params.get('output_path', 'unknown')}\n"
+
+            results.append(result)
+
+        return "\n".join(results)
 
     async def cleanup(self):
         """Cleanup when shutting down"""

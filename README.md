@@ -6,12 +6,13 @@ A standalone Model Context Protocol (MCP) server that records video directly fro
 
 - **Direct ROS2 Integration**: Subscribes directly to ROS2 image topics using rclpy
 - **Standalone Recording**: No external ROS2 packages required - uses OpenCV for video encoding
-- **Auto-Detection**: Automatically detects FPS and resolution from the topic (enabled by default)
-- **Real-time Status**: Dynamic status updates showing FPS, resolution, and frame count
+- **Multi-Topic Recording**: Record multiple camera topics in parallel with a single command
+- **Auto-Detection**: Automatically detects FPS and resolution from each topic (enabled by default)
+- **Real-time Status**: Dynamic status updates showing FPS, resolution, and frame count for all recordings
 - **MCP Tools**:
-  - `start_recording`: Start recording from any ROS2 image topic
-  - `stop_recording`: Stop the current recording session
-  - `get_recording_status`: Check recording status
+  - `start_recording`: Start recording from one or more ROS2 image topics
+  - `stop_recording`: Stop specific or all recording sessions
+  - `get_recording_status`: Check status of all active recordings
 - **CLI Interface**: Command-line tool for manual control
 - **Python Library**: Use `VideoRecorderManager` in your own code
 
@@ -68,10 +69,10 @@ Add to your MCP client configuration file (e.g., `mcp_config.json`):
 
 #### start_recording
 
-Start recording video from a ROS2 image topic.
+Start recording video from one or more ROS2 image topics in parallel.
 
 **Parameters:**
-- `camera_topic` (string, default: "/camera_input"): ROS2 topic for camera images
+- `camera_topic` (string or list, default: "/camera_input"): ROS2 topic(s) for camera images. Can be a single topic or a list of topics to record in parallel
 - `fps` (integer, optional): Frame rate for recording (1-120). If not specified, auto-detects from topic
 - `image_height` (integer, optional): Image height in pixels. If not specified, auto-detects from first frame
 - `image_width` (integer, optional): Image width in pixels. If not specified, auto-detects from first frame
@@ -97,7 +98,10 @@ Video length: continuous
 
 #### stop_recording
 
-Stop the current recording session.
+Stop the current recording session(s). Can stop a specific topic or all recordings.
+
+**Parameters:**
+- `camera_topic` (string, optional): Specific topic to stop. If not provided, stops all active recordings.
 
 **Example Output:**
 ```
@@ -124,6 +128,18 @@ Frames recorded: 42
 ```
 
 ## CLI Usage
+
+### Record Multiple Topics in Parallel
+```bash
+# Record from 3 cameras simultaneously
+uv run ros2-recorder-cli start -t /camera1/image_raw /camera2/image_raw /camera3/image_raw
+
+# Record multiple topics with timestamp overlay
+uv run ros2-recorder-cli start -t /front/camera /back/camera --timestamp
+
+# Record for 30 seconds on multiple topics
+uv run ros2-recorder-cli record -d 30 -t /cam1 /cam2 /cam3
+```
 
 ### Start Recording
 ```bash
@@ -177,7 +193,11 @@ uv run ros2-recorder-cli record --duration 10 --camera-topic /camera/image_raw
 
 ### Stop Recording
 ```bash
+# Stop all recordings
 uv run ros2-recorder-cli stop
+
+# Stop a specific topic
+uv run ros2-recorder-cli stop -t /camera1/image_raw
 ```
 
 **Output:**
@@ -196,13 +216,38 @@ File size: 0.65 MB
 uv run ros2-recorder-cli status
 ```
 
-**Output:**
+**Output (single recording):**
 ```
-Status: Recording in progress
+Status: 1 recording(s) in progress
+
 Camera topic: /camera/image_raw
-FPS: 30
-Resolution: 1280x720
-Frames recorded: 42
+  FPS: 30
+  Resolution: 1280x720
+  Frames recorded: 42
+  Output: /home/user/videos/2026-01-07_07-02-21.mp4
+```
+
+**Output (multiple recordings):**
+```
+Status: 3 recording(s) in progress
+
+Camera topic: /camera1/image_raw
+  FPS: 30
+  Resolution: 1280x720
+  Frames recorded: 150
+  Output: /home/user/videos/2026-01-07_07-02-21.mp4
+
+Camera topic: /camera2/image_raw
+  FPS: 30
+  Resolution: 640x480
+  Frames recorded: 148
+  Output: /home/user/videos/2026-01-07_07-02-22.mp4
+
+Camera topic: /camera3/image_raw
+  FPS: 15
+  Resolution: 1920x1080
+  Frames recorded: 75
+  Output: /home/user/videos/2026-01-07_07-02-23.mp4
 ```
 
 ## Output Location
@@ -244,6 +289,7 @@ uv run ros2-recorder-cli start \
 
 ## Using as a Python Library
 
+### Single Topic Recording
 ```python
 import asyncio
 from ros2_video_recorder_mcp import VideoRecorderManager
@@ -274,16 +320,30 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+### Multiple Topics in Parallel
+```python
+# Record from 3 cameras simultaneously
+result = await manager.start_recording(
+    camera_topic=["/camera1/image_raw", "/camera2/image_raw", "/camera3/image_raw"],
+    overlay_timestamp=True
+)
+
+# Stop all recordings
+await manager.stop_recording()
+
+# Or stop a specific topic
+await manager.stop_recording(camera_topic="/camera1/image_raw")
+```
+
 ### With Manual Settings
 ```python
-# Specify exact FPS and resolution
+# Specify exact FPS and resolution for all topics
 result = await manager.start_recording(
-    camera_topic="/camera/image_raw",
+    camera_topic=["/camera1/image_raw", "/camera2/image_raw"],
     fps=60,
     image_width=1920,
     image_height=1080,
-    overlay_timestamp=True,
-    verbose=True  # Enable ROS2 logging
+    overlay_timestamp=True
 )
 ```
 
@@ -359,10 +419,11 @@ The recorder runs in a background thread, continuously processing incoming ROS2 
 
 ## Recent Improvements
 
-### v1.1 (Current)
-- ✨ **Auto-detection**: FPS and resolution detected automatically from topic
+### v1.2 (Current)
+- 🎥 **Multi-Topic Recording**: Record multiple camera topics in parallel with a single command
+- ✨ **Auto-detection**: FPS and resolution detected automatically from each topic
 - ⚡ **Event-based Sync**: Replaced polling with asyncio events for faster startup
-- 📊 **Real-time Status**: Dynamic status line showing FPS, resolution, frames
+- 📊 **Real-time Status**: Dynamic status line showing FPS, resolution, frames for all recordings
 - 🔧 **Better Compatibility**: Fixed NumPy version, Python 3.10 requirement
 - 🚀 **Performance**: Removed unnecessary delays (~0.5s faster startup)
 - 🐛 **Clean Output**: Minimal logging by default, `--verbose` flag for debugging

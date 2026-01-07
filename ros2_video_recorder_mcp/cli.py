@@ -83,8 +83,11 @@ async def start_recording_cmd(args):
 
     signal.signal(signal.SIGINT, signal_handler)
 
+    # camera_topic is now a list (from nargs='+')
+    camera_topics = args.camera_topic
+
     result = await manager.start_recording(
-        camera_topic=args.camera_topic,
+        camera_topic=camera_topics,
         fps=args.fps,
         image_height=args.height,
         image_width=args.width,
@@ -100,24 +103,28 @@ async def start_recording_cmd(args):
     )
 
     print(result)
-    print("\nRecording in progress. Press Ctrl+C to stop...")
+    print(f"\nRecording {len(camera_topics)} topic(s) in progress. Press Ctrl+C to stop...")
 
     # Keep the process alive and update display with detected values
     try:
         while not interrupted:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.5)
 
-            # Update display with current values
-            if manager.recorder_node and manager.recorder_node.video_writer_initialized:
-                fps = manager.recorder_node.fps
-                width = manager.recorder_node.width
-                height = manager.recorder_node.height
-                frames = manager.recorder_node.frame_count
-                status_line = f"\rStatus: FPS={fps}, Resolution={width}x{height}, Frames={frames}"
-                print(status_line, end='', flush=True)
-            else:
-                # Still detecting
-                print("\rDetecting FPS and resolution...", end='', flush=True)
+            # Show status for all topics
+            status_lines = []
+            for topic in camera_topics:
+                recorder_node = manager.recorder_nodes.get(topic)
+                if recorder_node and recorder_node.video_writer_initialized:
+                    fps = recorder_node.fps
+                    width = recorder_node.width
+                    height = recorder_node.height
+                    frames = recorder_node.frame_count
+                    status_lines.append(f"{topic}: {fps}fps {width}x{height} {frames}frames")
+                else:
+                    status_lines.append(f"{topic}: detecting...")
+
+            # Clear line and print status
+            print("\r" + " | ".join(status_lines), end='', flush=True)
     except KeyboardInterrupt:
         interrupted = True
     
@@ -133,7 +140,8 @@ async def stop_recording_cmd(args):
     """Stop recording command"""
     # Use default folder path to find videos (relative to project root)
     manager = VideoRecorderManager(default_folder_path=get_default_videos_folder())
-    result = await manager.stop_recording()
+    camera_topic = getattr(args, 'camera_topic', None)
+    result = await manager.stop_recording(camera_topic=camera_topic)
     print(result)
 
 
@@ -193,8 +201,9 @@ def main():
     start_parser = subparsers.add_parser("start", help="Start recording")
     start_parser.add_argument(
         "--camera-topic", "-t",
-        default="/camera_input",
-        help="ROS2 camera topic (default: /camera_input)"
+        nargs='+',
+        default=["/camera_input"],
+        help="ROS2 camera topic(s). Can specify multiple topics to record in parallel (e.g., -t /cam1 /cam2). Default: /camera_input"
     )
     start_parser.add_argument(
         "--fps", "-f",
@@ -268,6 +277,11 @@ def main():
 
     # Stop command
     stop_parser = subparsers.add_parser("stop", help="Stop recording")
+    stop_parser.add_argument(
+        "--camera-topic", "-t",
+        default=None,
+        help="Specific camera topic to stop (default: stop all recordings)"
+    )
     stop_parser.set_defaults(func=stop_recording_cmd)
 
     # Status command
@@ -287,8 +301,9 @@ def main():
     )
     record_parser.add_argument(
         "--camera-topic", "-t",
-        default="/camera_input",
-        help="ROS2 camera topic (default: /camera_input)"
+        nargs='+',
+        default=["/camera_input"],
+        help="ROS2 camera topic(s). Can specify multiple topics to record in parallel (e.g., -t /cam1 /cam2). Default: /camera_input"
     )
     record_parser.add_argument(
         "--fps", "-f",

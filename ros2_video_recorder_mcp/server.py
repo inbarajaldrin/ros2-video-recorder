@@ -9,7 +9,7 @@ making it a fully standalone solution that requires only the ROS2 environment.
 
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Union, List
 from dataclasses import dataclass
 from mcp.server.fastmcp import FastMCP, Context
 from .recorder_manager import VideoRecorderManager
@@ -51,10 +51,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 mcp = FastMCP("ros2-video-recorder", lifespan=app_lifespan)
 
 
-@mcp.tool(description="Start recording video from a ROS2 image topic. Records continuously until stopped (default) or for a specified duration. Videos are saved with timestamps in the filename.")
+@mcp.tool(description="Start recording video from one or more ROS2 image topics. Records continuously until stopped (default) or for a specified duration. Videos are saved with timestamps in the filename. Can record multiple topics in parallel by passing a list.")
 async def start_recording(
     ctx: Context,
-    camera_topic: str,
+    camera_topic: Union[str, List[str]],
     fps: int = None,
     image_height: int = None,
     image_width: int = None,
@@ -69,10 +69,10 @@ async def start_recording(
     file_type: str = "mp4"
 ) -> str:
     """
-    Start recording video from a ROS2 image topic.
+    Start recording video from one or more ROS2 image topics.
 
     Args:
-        camera_topic: ROS2 topic name for camera images (e.g., /camera/image_raw) (required)
+        camera_topic: ROS2 topic name(s) for camera images. Can be a single string (e.g., "/camera/image_raw") or a list of strings (e.g., ["/camera1/image_raw", "/camera2/image_raw"]) to record multiple topics in parallel. (required)
         fps: Frame rate for recording (frames per second, 1-120). If None, auto-detects from topic (default: None)
         image_height: Image height in pixels. If None, auto-detects from first frame (default: None)
         image_width: Image width in pixels. If None, auto-detects from first frame (default: None)
@@ -87,7 +87,7 @@ async def start_recording(
         file_type: Video file extension (e.g., mp4, avi)
 
     Returns:
-        Status message indicating success or failure
+        Status message indicating success or failure for all topics
     """
     manager = ctx.request_context.lifespan_context.manager
     return await manager.start_recording(
@@ -107,16 +107,19 @@ async def start_recording(
     )
 
 
-@mcp.tool(description="Stop the current video recording session gracefully")
-async def stop_recording(ctx: Context) -> str:
+@mcp.tool(description="Stop the current video recording session(s) gracefully. Can stop a specific topic or all recordings.")
+async def stop_recording(ctx: Context, camera_topic: str = None) -> str:
     """
-    Stop the current recording.
+    Stop the current recording(s).
+
+    Args:
+        camera_topic: Optional. If provided, stop only this topic's recording. If None, stop all active recordings.
 
     Returns:
-        Status message indicating success or failure, including the path to the saved video
+        Status message indicating success or failure, including the path(s) to the saved video(s)
     """
     manager = ctx.request_context.lifespan_context.manager
-    return await manager.stop_recording()
+    return await manager.stop_recording(camera_topic=camera_topic)
 
 
 @mcp.tool(description="Check if video recording is currently active")
