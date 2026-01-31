@@ -271,7 +271,7 @@ class VideoRecorderManager:
 
     def _start_executor_thread(self):
         """Start the rclpy executor in a background thread"""
-        if self.executor is None:
+        if self.executor is None or not self.executor_thread.is_alive():
             from rclpy.executors import SingleThreadedExecutor
             self.executor = SingleThreadedExecutor()
             self.executor_thread = threading.Thread(
