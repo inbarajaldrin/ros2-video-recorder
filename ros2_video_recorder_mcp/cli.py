@@ -29,7 +29,7 @@ import os
 import atexit
 import signal
 from pathlib import Path
-from .recorder_manager import VideoRecorderManager
+from .video_manager import VideoRecorderManager
 
 
 def get_project_root() -> Path:

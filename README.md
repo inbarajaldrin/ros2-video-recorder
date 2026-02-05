@@ -13,8 +13,9 @@ A standalone Model Context Protocol (MCP) server that records video directly fro
   - `start_recording`: Start recording from one or more ROS2 image topics
   - `stop_recording`: Stop specific or all recording sessions
   - `get_recording_status`: Check status of all active recordings
+  - `capture_camera_image`: Capture a single image for AI analysis
 - **CLI Interface**: Command-line tool for manual control
-- **Python Library**: Use `VideoRecorderManager` in your own code
+- **Python Library**: Use `VideoRecorderManager` and `CameraCaptureManager` in your own code
 
 ## Prerequisites
 
@@ -126,6 +127,35 @@ FPS: 30
 Resolution: 1280x720
 Frames recorded: 42
 ```
+
+#### capture_camera_image
+
+Capture a single image from a ROS2 camera topic. Returns the image so AI agents can see and analyze it.
+
+**Parameters:**
+- `topic_name` (string, required): ROS2 image topic to capture from (e.g., "/camera/image_raw")
+- `timeout` (integer, default: 10): Timeout in seconds for image capture
+
+**Returns:** A list containing:
+1. JSON status with metadata (timestamp, topic, resolution, saved path)
+2. The captured image (JPEG) that AI agents can view and analyze
+
+**Example Output:**
+```json
+{
+  "timestamp": "2026-01-07T10:30:45.123456",
+  "topic": "/camera/image_raw",
+  "status": "success",
+  "message": "Image captured from /camera/image_raw",
+  "saved_to": "/home/user/screenshots/20260107_103045_camera_image_raw.jpg",
+  "resolution": "1280x720"
+}
+```
+
+**Features:**
+- Automatic backup: Screenshots saved to `screenshots/` directory
+- Timeout handling: Falls back to latest saved screenshot on timeout
+- Fresh capture: Always gets the latest frame (not buffered)
 
 ## CLI Usage
 
@@ -253,8 +283,8 @@ Camera topic: /camera3/image_raw
 ## Output Location
 
 ### Default Behavior
-- **No environment variables**: Videos saved to `./videos/`
-- **With `MCP_CLIENT_OUTPUT_DIR`**: Videos saved to `{MCP_CLIENT_OUTPUT_DIR}/videos/`
+- **No environment variables**: Videos saved to `./videos/`, screenshots to `./screenshots/`
+- **With `MCP_CLIENT_OUTPUT_DIR`**: Videos saved to `{MCP_CLIENT_OUTPUT_DIR}/videos/`, screenshots to `{MCP_CLIENT_OUTPUT_DIR}/screenshots/`
 
 ### Filename Format
 - Default: `YYYY-MM-DD_HH-MM-SS.mp4`
@@ -347,6 +377,29 @@ result = await manager.start_recording(
 )
 ```
 
+### Capture Single Image
+```python
+from ros2_video_recorder_mcp import CameraCaptureManager
+
+async def capture_example():
+    capture_manager = CameraCaptureManager(screenshots_dir="./screenshots")
+
+    # Capture a single frame
+    result = await capture_manager.capture_image(
+        topic_name="/camera/image_raw",
+        timeout=10
+    )
+
+    if result.success:
+        print(f"Captured {result.width}x{result.height} image")
+        print(f"Saved to: {result.saved_path}")
+        # result.image_data contains RGB numpy array
+    else:
+        print(f"Failed: {result.message}")
+
+    await capture_manager.cleanup()
+```
+
 ## Troubleshooting
 
 ### Import Error: "Failed to import rclpy"
@@ -394,7 +447,8 @@ ros2-video-recorder/
 ├── ros2_video_recorder_mcp/
 │   ├── __init__.py          # Package exports
 │   ├── server.py            # MCP server implementation
-│   ├── recorder_manager.py  # Core video recorder (ROS2 node + manager)
+│   ├── video_manager.py     # Video recording (ROS2 node + manager)
+│   ├── image_manager.py     # Image capture (single frame capture)
 │   └── cli.py               # Standalone CLI tool
 ├── pyproject.toml           # Project dependencies and metadata
 └── README.md                # This file

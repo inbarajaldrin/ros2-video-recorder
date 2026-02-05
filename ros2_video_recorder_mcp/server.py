@@ -12,21 +12,26 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Union, List
 from dataclasses import dataclass
 from mcp.server.fastmcp import FastMCP, Context
-from .recorder_manager import VideoRecorderManager
+from fastmcp.utilities.types import Image as MCPImage
+from .video_manager import VideoRecorderManager
+from .image_manager import CameraCaptureManager, numpy_to_bytes_jpeg
 
 
 # Output directories - use MCP_CLIENT_OUTPUT_DIR if set, otherwise use relative paths
 BASE_OUTPUT_DIR = os.getenv("MCP_CLIENT_OUTPUT_DIR", "").strip()
 if BASE_OUTPUT_DIR:
     VIDEOS_DIR = os.path.join(BASE_OUTPUT_DIR, "videos")
+    SCREENSHOTS_DIR = os.path.join(BASE_OUTPUT_DIR, "screenshots")
 else:
     VIDEOS_DIR = "videos"
+    SCREENSHOTS_DIR = "screenshots"
 
 
 @dataclass
 class AppContext:
-    """Application context holding the video recorder manager"""
-    manager: VideoRecorderManager
+    """Application context holding the video recorder and camera capture managers"""
+    video_manager: VideoRecorderManager
+    image_manager: CameraCaptureManager
 
 
 @asynccontextmanager
@@ -34,17 +39,19 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     """
     Lifespan context manager for proper resource initialization and cleanup.
 
-    This ensures the VideoRecorderManager is properly cleaned up when the MCP server
+    This ensures the managers are properly cleaned up when the MCP server
     disconnects, not just on process exit. This fixes issues with server refresh
     where stale ROS 2 state would persist.
     """
-    # Initialize manager on server startup
-    manager = VideoRecorderManager(default_folder_path=VIDEOS_DIR)
+    # Initialize managers on server startup
+    video_manager = VideoRecorderManager(default_folder_path=VIDEOS_DIR)
+    image_manager = CameraCaptureManager(screenshots_dir=SCREENSHOTS_DIR)
     try:
-        yield AppContext(manager=manager)
+        yield AppContext(video_manager=video_manager, image_manager=image_manager)
     finally:
         # Cleanup on server shutdown (including refresh/reconnect)
-        await manager.cleanup()
+        await video_manager.cleanup()
+        await image_manager.cleanup()
 
 
 # Initialize MCP server with lifespan
@@ -89,8 +96,8 @@ async def start_recording(
     Returns:
         Status message indicating success or failure for all topics
     """
-    manager = ctx.request_context.lifespan_context.manager
-    return await manager.start_recording(
+    video_manager = ctx.request_context.lifespan_context.video_manager
+    return await video_manager.start_recording(
         camera_topic=camera_topic,
         fps=fps,
         image_height=image_height,
@@ -118,8 +125,8 @@ async def stop_recording(ctx: Context, camera_topic: str = None) -> str:
     Returns:
         Status message indicating success or failure, including the path(s) to the saved video(s)
     """
-    manager = ctx.request_context.lifespan_context.manager
-    return await manager.stop_recording(camera_topic=camera_topic)
+    video_manager = ctx.request_context.lifespan_context.video_manager
+    return await video_manager.stop_recording(camera_topic=camera_topic)
 
 
 @mcp.tool(description="Check if video recording is currently active")
@@ -130,8 +137,59 @@ async def get_recording_status(ctx: Context) -> str:
     Returns:
         Status message with details about the recording
     """
-    manager = ctx.request_context.lifespan_context.manager
-    return await manager.get_status()
+    video_manager = ctx.request_context.lifespan_context.video_manager
+    return await video_manager.get_status()
+
+
+@mcp.tool(description="Capture a single image from a ROS2 camera topic. Returns the image so the agent can see and analyze it, along with status information.")
+async def capture_camera_image(ctx: Context, topic_name: str, timeout: int = 10) -> list:
+    """
+    Capture camera image from any ROS2 image topic.
+    Returns a list with status info and the image that the agent can see.
+
+    Args:
+        topic_name: The ROS2 topic to subscribe to (e.g., "/camera/image_raw")
+        timeout: Timeout in seconds for image capture (default: 10)
+
+    Returns:
+        List containing status JSON and optionally the captured image
+    """
+    import json
+    image_manager = ctx.request_context.lifespan_context.image_manager
+
+    result = await image_manager.capture_image(topic_name, timeout)
+
+    # Build status response
+    status = {
+        "timestamp": result.timestamp,
+        "topic": result.topic,
+        "status": "success" if result.success else ("timeout" if "Timeout" in result.message else "error"),
+        "message": result.message
+    }
+
+    if result.saved_path:
+        status["saved_to"] = result.saved_path
+    if result.width and result.height:
+        status["resolution"] = f"{result.width}x{result.height}"
+    if result.is_fallback:
+        status["is_fallback"] = True
+
+    # If we have image data, return it along with status
+    if result.success and result.image_data is not None:
+        # Convert numpy image to JPEG bytes for MCP Image
+        jpeg_bytes = numpy_to_bytes_jpeg(result.image_data)
+
+        # Use FastMCP's Image helper for proper MCP format
+        mcp_image = MCPImage(data=jpeg_bytes)
+
+        # Return list with status text and image content
+        return [
+            json.dumps(status, indent=2),
+            mcp_image.to_image_content(mime_type="image/jpeg")
+        ]
+    else:
+        # No image available, return only status
+        return [json.dumps(status, indent=2)]
 
 
 def main():
