@@ -52,7 +52,11 @@ class VideoRecorderNode(Node):
             auto_resolution: Auto-detect resolution from first frame
             on_values_detected: Optional callback when values are auto-detected
         """
-        super().__init__('video_recorder_node')
+        # Generate unique node name from topic to avoid conflicts with multiple recorders
+        # Replace slashes and special chars with underscores for valid ROS2 node name
+        topic_suffix = camera_topic.strip('/').replace('/', '_').replace('-', '_')
+        node_name = f'video_recorder_{topic_suffix}'
+        super().__init__(node_name)
         # Set logger level to WARN to suppress INFO messages
         self.get_logger().set_level(30)  # 30 = WARN level (suppresses INFO)
 
@@ -218,9 +222,11 @@ class VideoRecorderNode(Node):
 
     def stop_recording(self):
         """Stop recording and release resources"""
-        self.is_recording = False
-        if self.video_writer and self.video_writer.isOpened():
-            with self.lock:
+        with self.lock:
+            # Set is_recording to False inside the lock to prevent race condition
+            # where a frame could be mid-write when we call release()
+            self.is_recording = False
+            if self.video_writer and self.video_writer.isOpened():
                 self.video_writer.release()
         self.get_logger().info(f"Recording stopped. Frames recorded: {self.frame_count}")
 
@@ -411,9 +417,79 @@ class VideoRecorderManager:
             else:
                 return None, frame_count if frame_count > 0 else None, fps if fps > 0 else None
                 
-        except Exception as e:
+        except Exception:
             # Silently fail - return None values
             return None, None, None
+
+    async def _wait_for_video_complete(self, video_path: str, expected_frames: int, timeout: float = 10.0) -> bool:
+        """
+        Wait for the video file to be fully written and finalized.
+
+        This is critical for MP4 files where the moov atom (index) is written at the end.
+        The function waits until:
+        1. The file size stabilizes (no more writes)
+        2. The file can be opened and read by OpenCV
+        3. OS buffers are flushed to disk
+
+        Args:
+            video_path: Path to the video file
+            expected_frames: Number of frames we expect (from recorder tracking)
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if file appears complete, False if timeout or error
+        """
+        import os
+        import time
+
+        start_time = time.time()
+        last_size = -1
+        stable_count = 0
+
+        while time.time() - start_time < timeout:
+            try:
+                # Check current file size
+                current_size = Path(video_path).stat().st_size
+
+                # File size hasn't changed - might be stable
+                if current_size == last_size and current_size > 0:
+                    stable_count += 1
+
+                    # After 3 consecutive checks with same size, verify file is readable
+                    if stable_count >= 3:
+                        # Force OS to flush buffers
+                        try:
+                            with open(video_path, 'r+b') as f:
+                                os.fsync(f.fileno())
+                        except Exception:
+                            pass
+
+                        # Verify file is readable by OpenCV
+                        file_duration, file_frame_count, file_fps = self._get_video_metadata(Path(video_path))
+
+                        if file_frame_count is not None and file_frame_count > 0:
+                            # File is readable and has frames - consider it complete
+                            # Note: frame count may differ slightly from expected due to timing
+                            return True
+                else:
+                    # Size changed - reset stability counter
+                    stable_count = 0
+                    last_size = current_size
+
+            except Exception:
+                pass
+
+            # Small delay between checks
+            await asyncio.sleep(0.1)
+
+        # Timeout - do final fsync and return
+        try:
+            with open(video_path, 'r+b') as f:
+                os.fsync(f.fileno())
+        except Exception:
+            pass
+
+        return False
 
     async def _start_single_recording(
         self,
@@ -705,9 +781,8 @@ class VideoRecorderManager:
                 frame_count = recorder_node.frame_count
                 fps = recorder_node.fps
                 recording_start_time = recorder_node.recording_start_time
-                recorder_node.stop_recording()
 
-                # Load state to get output path and start time (before cleanup)
+                # Load state to get output path BEFORE stopping (need for verification)
                 state = self._load_state()
                 output_path = None
                 start_time = None
@@ -716,9 +791,17 @@ class VideoRecorderManager:
                     output_path = rec_state.get("params", {}).get("output_path")
                     start_time = rec_state.get("start_time")
 
+                # Stop recording - this releases the video writer
+                recorder_node.stop_recording()
+
                 # Use node's start time if available (more accurate), otherwise use state
                 if not recording_start_time and start_time:
                     recording_start_time = datetime.fromtimestamp(start_time)
+
+                # Wait for video file to be fully written and finalized
+                # MP4 files need the moov atom written at the end, which may take time
+                if output_path and Path(output_path).exists():
+                    await self._wait_for_video_complete(output_path, frame_count, timeout=10.0)
 
                 # Calculate actual stop time from video file duration (most accurate)
                 # This ensures stop time matches the actual video content, not when stop_recording() was called
@@ -733,9 +816,6 @@ class VideoRecorderManager:
                 # Fallback to current time if we can't calculate from video
                 if stop_time is None:
                     stop_time = datetime.now()
-
-                # Give video writer time to flush
-                await asyncio.sleep(0.5)
 
                 # Clean up
                 if self.executor and recorder_node:
