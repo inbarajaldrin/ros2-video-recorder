@@ -633,6 +633,10 @@ class VideoRecorderManager:
                         # Clean up this failed recording
                         if self.executor:
                             self.executor.remove_node(recorder_node)
+                        try:
+                            recorder_node.destroy_node()
+                        except Exception:
+                            pass
                         del self.recorder_nodes[camera_topic]
                         del self.output_paths[camera_topic]
                         self._clear_state(camera_topic)
@@ -667,7 +671,11 @@ class VideoRecorderManager:
             # Clean up this recording on error
             self._clear_state(camera_topic)
             if camera_topic in self.recorder_nodes:
-                del self.recorder_nodes[camera_topic]
+                node = self.recorder_nodes.pop(camera_topic)
+                try:
+                    node.destroy_node()
+                except Exception:
+                    pass
             if camera_topic in self.output_paths:
                 del self.output_paths[camera_topic]
             return f"Error: Failed to start recording. {str(e)}"
@@ -820,6 +828,10 @@ class VideoRecorderManager:
                 # Clean up
                 if self.executor and recorder_node:
                     self.executor.remove_node(recorder_node)
+                try:
+                    recorder_node.destroy_node()
+                except Exception:
+                    pass
                 del self.recorder_nodes[topic]
                 if topic in self.output_paths:
                     del self.output_paths[topic]
@@ -890,7 +902,11 @@ class VideoRecorderManager:
                 # Clean up this recording on error
                 self._clear_state(topic)
                 if topic in self.recorder_nodes:
-                    del self.recorder_nodes[topic]
+                    node = self.recorder_nodes.pop(topic)
+                    try:
+                        node.destroy_node()
+                    except Exception:
+                        pass
                 if topic in self.output_paths:
                     del self.output_paths[topic]
                 results.append(f"Error stopping recording for topic '{topic}': {str(e)}\n")

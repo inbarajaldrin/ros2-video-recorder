@@ -218,6 +218,10 @@ class CameraCaptureManager:
                 # Cleanup node
                 if self.executor and capture_node:
                     self.executor.remove_node(capture_node)
+                try:
+                    capture_node.destroy_node()
+                except Exception:
+                    pass
 
                 # Try fallback to latest screenshot
                 fallback = self._get_latest_screenshot()
@@ -253,6 +257,10 @@ class CameraCaptureManager:
             # Cleanup node
             if self.executor and capture_node:
                 self.executor.remove_node(capture_node)
+            try:
+                capture_node.destroy_node()
+            except Exception:
+                pass
 
             if frame_rgb is None:
                 return CaptureResult(
@@ -289,6 +297,10 @@ class CameraCaptureManager:
             if self.executor and capture_node:
                 try:
                     self.executor.remove_node(capture_node)
+                except Exception:
+                    pass
+                try:
+                    capture_node.destroy_node()
                 except Exception:
                     pass
 
