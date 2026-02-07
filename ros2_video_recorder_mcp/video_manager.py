@@ -77,6 +77,7 @@ class VideoRecorderNode(Node):
         self.is_recording = False
         self.lock = threading.Lock()
         self.video_writer_initialized = False
+        self.latest_frame_rgb = None  # Most recent frame in RGB format for image capture
         self.recording_start_time = None  # Track when recording actually starts (when first frame is written)
         self.first_frame_written = False  # Track if first frame has been written
 
@@ -190,6 +191,9 @@ class VideoRecorderNode(Node):
             # Resize if necessary (only if not auto-detected)
             if not self.auto_resolution and (frame.shape[0] != self.height or frame.shape[1] != self.width):
                 frame = cv2.resize(frame, (self.width, self.height))
+
+            # Store latest frame in RGB for image capture (before timestamp overlay)
+            self.latest_frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Overlay timestamp if requested
             if self.overlay_timestamp:
@@ -912,6 +916,21 @@ class VideoRecorderManager:
                 results.append(f"Error stopping recording for topic '{topic}': {str(e)}\n")
 
         return "\n".join(results)
+
+    def get_latest_frame(self, camera_topic: str) -> Optional[np.ndarray]:
+        """
+        Get the latest frame from an active recording on the given topic.
+
+        Args:
+            camera_topic: The ROS2 topic to get the frame from
+
+        Returns:
+            RGB numpy array of the latest frame, or None if no active recording
+        """
+        recorder_node = self.recorder_nodes.get(camera_topic)
+        if recorder_node and recorder_node.is_recording and recorder_node.latest_frame_rgb is not None:
+            return recorder_node.latest_frame_rgb.copy()
+        return None
 
     async def get_status(self) -> str:
         """

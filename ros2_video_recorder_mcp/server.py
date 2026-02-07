@@ -155,9 +155,40 @@ async def capture_camera_image(ctx: Context, topic_name: str, timeout: int = 10)
         List containing status JSON and optionally the captured image
     """
     import json
+    from datetime import datetime
+    from .image_manager import CaptureResult
+
+    video_manager = ctx.request_context.lifespan_context.video_manager
     image_manager = ctx.request_context.lifespan_context.image_manager
 
-    result = await image_manager.capture_image(topic_name, timeout)
+    # If there's an active video recording on this topic, grab the frame directly
+    # instead of creating a competing subscription that would time out
+    frame_rgb = video_manager.get_latest_frame(topic_name)
+    if frame_rgb is not None:
+        timestamp = datetime.now().isoformat()
+        # Save screenshot backup
+        save_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        topic_clean = topic_name.replace("/", "_").strip("_")
+        filename = f"{save_timestamp}_{topic_clean}.jpg"
+        save_path = os.path.join(image_manager.screenshots_dir, filename)
+
+        import cv2
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(save_path, frame_bgr)
+
+        result = CaptureResult(
+            success=True,
+            image_data=frame_rgb,
+            message=f"Image captured from {topic_name} (from active recording)",
+            topic=topic_name,
+            timestamp=timestamp,
+            saved_path=save_path,
+            width=frame_rgb.shape[1],
+            height=frame_rgb.shape[0],
+            is_fallback=False
+        )
+    else:
+        result = await image_manager.capture_image(topic_name, timeout)
 
     # Build status response
     status = {
