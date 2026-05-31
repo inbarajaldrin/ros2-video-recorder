@@ -276,6 +276,9 @@ class CameraCaptureManager:
             filename = f"{save_timestamp}_{topic_clean}.jpg"
             save_path = os.path.join(self.screenshots_dir, filename)
 
+            # Ensure screenshots directory exists (may have been cleared externally)
+            Path(self.screenshots_dir).mkdir(parents=True, exist_ok=True)
+
             # Convert RGB to BGR for saving
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             cv2.imwrite(save_path, frame_bgr)
