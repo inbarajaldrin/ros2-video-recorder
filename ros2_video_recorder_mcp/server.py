@@ -70,7 +70,7 @@ async def start_recording(
     video_length: int = 0,
     auto_fps: bool = True,
     auto_resolution: bool = True,
-    video_codec: str = "mp4v",
+    video_codec: str = "h264",
     file_prefix: str = "",
     file_postfix: str = "",
     file_type: str = "mp4"
@@ -88,7 +88,7 @@ async def start_recording(
         video_length: Length of each video segment in seconds (0 = continuous recording)
         auto_fps: Auto-detect topic framerate (default: True). Disabled if fps is explicitly set
         auto_resolution: Auto-detect image resolution from topic (default: True). Disabled if width/height are explicitly set
-        video_codec: Video codec to use (e.g., mp4v, h264)
+        video_codec: Video codec to use (default: h264, encoded via ffmpeg pipe for universal playback; mp4v uses cv2 but won't play in QuickTime/browsers)
         file_prefix: Prefix for output filenames
         file_postfix: Postfix for output filenames
         file_type: Video file extension (e.g., mp4, avi)

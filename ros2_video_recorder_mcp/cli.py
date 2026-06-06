@@ -250,8 +250,8 @@ def main():
     )
     start_parser.add_argument(
         "--codec",
-        default="mp4v",
-        help="Video codec (default: mp4v)"
+        default="h264",
+        help="Video codec (default: h264 via ffmpeg pipe; mp4v falls back to cv2)"
     )
     start_parser.add_argument(
         "--prefix",
@@ -344,8 +344,8 @@ def main():
     )
     record_parser.add_argument(
         "--codec",
-        default="mp4v",
-        help="Video codec (default: mp4v)"
+        default="h264",
+        help="Video codec (default: h264 via ffmpeg pipe; mp4v falls back to cv2)"
     )
     record_parser.add_argument(
         "--prefix",

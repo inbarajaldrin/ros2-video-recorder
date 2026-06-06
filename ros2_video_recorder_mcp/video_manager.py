@@ -8,6 +8,8 @@ with the ROS2 network and OpenCV to encode and save video files.
 """
 
 import asyncio
+import shutil
+import subprocess
 import threading
 import cv2
 import numpy as np
@@ -54,6 +56,81 @@ def _stamp_seconds(msg) -> float:
     """
     s = msg.header.stamp
     return s.sec + s.nanosec * 1e-9
+
+
+class _FfmpegPipeWriter:
+    """Drop-in cv2.VideoWriter replacement that pipes BGR frames to an ffmpeg subprocess.
+
+    Why this exists: prebuilt OpenCV ships without any H.264 encoder (libx264 is GPL,
+    OpenH264 is patent-encumbered), so cv2.VideoWriter can only produce MPEG-4 Part 2
+    ('mp4v') - which QuickTime and browsers no longer play (green screen). The system
+    ffmpeg binary does have libx264, so we encode through it instead: raw bgr24 frames
+    in via stdin, H.264 yuv420p +faststart mp4 out. Single encode, no intermediate file.
+    """
+
+    def __init__(self, output_path: str, fps: float, width: int, height: int):
+        self._open = False
+        self.proc = subprocess.Popen(
+            [
+                'ffmpeg', '-y', '-loglevel', 'error',
+                '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+                '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
+                '-c:v', 'libx264', '-preset', 'veryfast',
+                # yuv420p needs even dimensions; pad by a pixel if the source is odd
+                '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+                '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+                output_path,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._open = True
+
+    def isOpened(self) -> bool:
+        return self._open and self.proc.poll() is None
+
+    def write(self, frame) -> None:
+        try:
+            self.proc.stdin.write(frame.tobytes())
+        except (BrokenPipeError, ValueError):
+            # ffmpeg died (bad params, disk full); isOpened() goes False via poll()
+            self._open = False
+
+    def release(self) -> None:
+        if not self._open:
+            return
+        self._open = False
+        try:
+            self.proc.stdin.close()
+            # ffmpeg finalizes the mp4 here (incl. the +faststart moov rewrite)
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()  # SIGTERM, never SIGKILL
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        except Exception:
+            pass
+
+
+def _create_video_writer(output_path: str, video_codec: str, fps, width: int, height: int):
+    """Create the best available writer for the requested codec.
+
+    'h264' (and aliases) -> ffmpeg pipe writer when the ffmpeg binary exists, since
+    cv2 cannot encode H.264 (see _FfmpegPipeWriter). Anything else - or no ffmpeg -
+    falls back to cv2.VideoWriter with the given fourcc.
+    """
+    codec = (video_codec or 'mp4v').lower()
+    if codec in ('h264', 'avc1', 'x264', 'libx264'):
+        if shutil.which('ffmpeg'):
+            return _FfmpegPipeWriter(output_path, fps, width, height)
+        # No ffmpeg binary: cv2 almost certainly can't encode H.264 either, so fall
+        # back to mp4v rather than fail the recording outright
+        codec = 'mp4v'
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    return cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
 
 class VideoRecorderNode(Node):
@@ -140,13 +217,8 @@ class VideoRecorderNode(Node):
 
         # Initialize video writer if all parameters are provided
         if fps is not None and width is not None and height is not None:
-            fourcc = cv2.VideoWriter_fourcc(*video_codec)
-            self.video_writer = cv2.VideoWriter(
-                output_path,
-                fourcc,
-                fps,
-                (width, height)
-            )
+            self.video_writer = _create_video_writer(
+                output_path, video_codec, fps, width, height)
 
             if not self.video_writer.isOpened():
                 raise RuntimeError(f"Failed to open video writer for {output_path}")
@@ -160,14 +232,9 @@ class VideoRecorderNode(Node):
             self.get_logger().info(f"Recording started (auto-detect mode): {output_path}")
 
     def _open_video_writer(self):
-        """Construct the cv2.VideoWriter and signal waiters. Caller must hold self.lock."""
-        fourcc = cv2.VideoWriter_fourcc(*self.video_codec)
-        self.video_writer = cv2.VideoWriter(
-            self.output_path,
-            fourcc,
-            self.fps,
-            (self.width, self.height)
-        )
+        """Construct the video writer and signal waiters. Caller must hold self.lock."""
+        self.video_writer = _create_video_writer(
+            self.output_path, self.video_codec, self.fps, self.width, self.height)
 
         if not self.video_writer.isOpened():
             raise RuntimeError(f"Failed to open video writer for {self.output_path}")
@@ -811,7 +878,7 @@ class VideoRecorderManager:
         video_length: int = 0,
         auto_fps: bool = True,
         auto_resolution: bool = True,
-        video_codec: str = "mp4v",
+        video_codec: str = "h264",
         file_prefix: str = "",
         file_postfix: str = "",
         file_type: str = "mp4"
