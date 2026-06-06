@@ -44,6 +44,18 @@ except Exception:
 from .image_manager import _imgmsg_to_bgr
 
 
+def _stamp_seconds(msg) -> float:
+    """header.stamp as float seconds; 0.0 means the publisher didn't stamp.
+
+    The stamp is "capture time in the publisher's clock domain": wall clock for real
+    camera drivers, sim clock for Isaac Sim / Gazebo bridges. Timing the video off the
+    stamp makes recordings represent topic time consistently — a 5-sim-minute assembly
+    yields a 5-minute video even when the sim runs faster or slower than wall time.
+    """
+    s = msg.header.stamp
+    return s.sec + s.nanosec * 1e-9
+
+
 class VideoRecorderNode(Node):
     """ROS2 node that subscribes to camera topics and records video"""
 
@@ -89,6 +101,9 @@ class VideoRecorderNode(Node):
         self.video_writer = None
         self.frame_count = 0
         self.is_recording = False
+        # True once frames carry sim-clock header stamps (stamp < year-2001 epoch),
+        # meaning video timing is in sim time rather than wall time
+        self.sim_time_stamps = False
         self.lock = threading.Lock()
         self.video_writer_initialized = False
         self.latest_frame_rgb = None  # Most recent frame in RGB format for image capture
@@ -147,6 +162,13 @@ class VideoRecorderNode(Node):
             else:
                 frame = _imgmsg_to_bgr(msg)
 
+            # Capture time in the publisher's clock domain (sim time under use_sim_time,
+            # wall time for real cameras). 0.0 = unstamped publisher -> wall-clock fallback.
+            # Stamps below ~1e9 (year 2001) can't be wall epochs - they're a sim clock
+            # that started near zero, i.e. a different clock domain than the wall.
+            stamp = _stamp_seconds(msg)
+            self.sim_time_stamps = 0.0 < stamp < 1e9
+
             # Auto-detect resolution from first frame if needed
             if not self.video_writer_initialized:
                 if self.auto_resolution or self.height is None or self.width is None:
@@ -157,8 +179,12 @@ class VideoRecorderNode(Node):
                 # Auto-detect FPS if needed (will calculate from first few frames)
                 fps_ready = False
                 if self.auto_fps and self.fps is None:
-                    # We need to detect FPS - collect frame intervals
-                    current_time = datetime.now().timestamp()
+                    # We need to detect FPS - collect frame intervals. Prefer header
+                    # stamps over wall-clock arrival time: under sim speedup/slowdown,
+                    # wall intervals measure the simulator's real-time factor, not the
+                    # camera's publish rate, and would make video duration depend on
+                    # how fast the sim happened to run.
+                    current_time = stamp if stamp > 0.0 else datetime.now().timestamp()
                     if self.last_frame_time is not None:
                         frame_interval = current_time - self.last_frame_time
                         if frame_interval > 0:
@@ -213,9 +239,19 @@ class VideoRecorderNode(Node):
             # Store latest frame in RGB for image capture (before timestamp overlay)
             self.latest_frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Overlay timestamp if requested
+            # Overlay timestamp if requested. Use the frame's own stamp so the on-screen
+            # clock advances at playback speed even when the sim runs faster/slower than
+            # wall time (datetime.now() would drift by the real-time factor).
             if self.overlay_timestamp:
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                if stamp >= 1e9:
+                    # Stamp is a real epoch (wall-clock-synced publisher)
+                    timestamp = datetime.fromtimestamp(stamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                elif stamp > 0.0:
+                    # Sim clock that started near zero - show elapsed sim time
+                    timestamp = f"sim {stamp:.3f}s"
+                else:
+                    # Unstamped publisher - wall clock is all we have
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                 cv2.putText(
                     frame,
                     timestamp,
@@ -835,8 +871,13 @@ class VideoRecorderManager:
 
                 # Calculate actual stop time from video file duration (most accurate)
                 # This ensures stop time matches the actual video content, not when stop_recording() was called
+                # Only valid when video time == wall time: if frames carried sim-clock
+                # stamps, the video duration is in the sim time domain and adding it to a
+                # wall-clock start would produce a bogus timestamp whenever the sim runs
+                # faster/slower than real time. Fall back to datetime.now() in that case.
                 stop_time = None
-                if output_path and Path(output_path).exists():
+                video_in_wall_time = not getattr(recorder_node, 'sim_time_stamps', False)
+                if video_in_wall_time and output_path and Path(output_path).exists():
                     file_duration, file_frame_count, file_fps = self._get_video_metadata(Path(output_path))
                     if recording_start_time and file_duration:
                         # Calculate stop time based on start time + actual video duration
