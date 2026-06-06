@@ -21,12 +21,44 @@ from dataclasses import dataclass
 try:
     from rclpy.node import Node
     from sensor_msgs.msg import Image as RosImage
-    from cv_bridge import CvBridge
 except ImportError as e:
     raise ImportError(
         "Failed to import rclpy. Make sure you are using the correct Python version "
         "(ROS2 Humble requires Python 3.10)."
     ) from e
+
+# cv_bridge (ROS Humble) is built against the numpy 1.x ABI. Under numpy 2.x it still
+# *imports* (numpy just prints a warning traceback to stderr), but calling any conversion is
+# undefined behavior: sometimes AttributeError (_ARRAY_API not found), sometimes a segfault.
+# Don't import it at all under numpy >= 2 — capture uses the manual converter below instead
+# (pure cv2 + numpy, version-safe). Skipping the import also keeps the scary numpy ABI
+# traceback out of the MCP server startup log.
+try:
+    if int(np.__version__.split('.')[0]) >= 2:
+        raise ImportError("cv_bridge is numpy-1-only; using manual conversion")
+    from cv_bridge import CvBridge
+except Exception:
+    CvBridge = None
+
+
+def _imgmsg_to_bgr(msg):
+    """Convert a sensor_msgs/Image to a BGR uint8 ndarray WITHOUT cv_bridge."""
+    enc = (getattr(msg, "encoding", "") or "rgb8").lower()
+    buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    h, w = msg.height, msg.width
+    if enc in ("rgb8", "bgr8", "rgba8", "bgra8"):
+        ch = 4 if enc.endswith("a8") else 3
+        img = buf.reshape(h, w, ch)
+        if enc == "rgb8":
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        elif enc == "rgba8":
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        elif enc == "bgra8":
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        return img[:, :, :3]
+    if enc in ("mono8", "8uc1"):
+        return cv2.cvtColor(buf.reshape(h, w), cv2.COLOR_GRAY2BGR)
+    return cv2.cvtColor(buf.reshape(h, w, 3), cv2.COLOR_RGB2BGR)  # best-effort fallback
 
 
 @dataclass
@@ -61,7 +93,7 @@ class CameraCaptureNode(Node):
         self.get_logger().set_level(30)  # WARN level
 
         self.camera_topic = camera_topic
-        self.bridge = CvBridge()
+        self.bridge = CvBridge() if CvBridge is not None else None
         self.captured_frame = None
         self.frame_captured_event = None
         self.event_loop = None
@@ -83,8 +115,8 @@ class CameraCaptureNode(Node):
                 return
 
             try:
-                # Convert ROS2 image to OpenCV format (BGR)
-                frame_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                # Convert ROS2 image to OpenCV format (BGR) — manual, no cv_bridge (numpy-2 safe)
+                frame_bgr = _imgmsg_to_bgr(msg)
                 # Convert to RGB for return
                 self.captured_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
