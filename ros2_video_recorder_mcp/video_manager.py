@@ -59,6 +59,11 @@ def _stamp_seconds(msg) -> float:
 class VideoRecorderNode(Node):
     """ROS2 node that subscribes to camera topics and records video"""
 
+    # Intervals to average for auto-fps detection. Small on purpose: frames are buffered
+    # (not dropped) during detection, but _start_single_recording blocks on
+    # values_detected_event, so a large window stalls startup on low-fps topics.
+    FPS_DETECT_INTERVALS = 5
+
     def __init__(self, camera_topic: str, fps: Optional[int], width: Optional[int], height: Optional[int],
                  overlay_timestamp: bool, output_path: str, video_codec: str,
                  auto_fps: bool = False, auto_resolution: bool = False,
@@ -113,7 +118,12 @@ class VideoRecorderNode(Node):
         # For auto FPS detection
         self.frame_timestamps = []
         self.last_frame_time = None
-        
+        # Pre-roll: frames received while auto-fps detection is still measuring, kept as
+        # (frame, stamp, arrival) tuples and flushed into the writer the moment it opens.
+        # Detection therefore costs no footage (~2.7MB per 720p frame, bounded by the
+        # detection window).
+        self.preroll_buffer = []
+
         # Event to signal when values are detected (for async waiting)
         self.values_detected_event = None  # Will be set by manager if needed
         self.event_loop = None  # Will be set by manager if needed
@@ -149,6 +159,82 @@ class VideoRecorderNode(Node):
             self.is_recording = True
             self.get_logger().info(f"Recording started (auto-detect mode): {output_path}")
 
+    def _open_video_writer(self):
+        """Construct the cv2.VideoWriter and signal waiters. Caller must hold self.lock."""
+        fourcc = cv2.VideoWriter_fourcc(*self.video_codec)
+        self.video_writer = cv2.VideoWriter(
+            self.output_path,
+            fourcc,
+            self.fps,
+            (self.width, self.height)
+        )
+
+        if not self.video_writer.isOpened():
+            raise RuntimeError(f"Failed to open video writer for {self.output_path}")
+
+        self.video_writer_initialized = True
+        # Don't set recording_start_time here - wait for first frame to be written
+        self.get_logger().info(f"Video writer initialized: {self.width}x{self.height} @ {self.fps} fps")
+
+        # Signal that values are detected (thread-safe)
+        if self.values_detected_event and self.event_loop:
+            self.event_loop.call_soon_threadsafe(self.values_detected_event.set)
+
+        # Notify callback if values were auto-detected (state-file update only; does
+        # not touch self.lock, so calling it while holding the lock is safe)
+        if self.on_values_detected:
+            self.on_values_detected()
+
+    def _write_frame(self, frame, stamp: float, arrival: datetime):
+        """Overlay + write one frame and update bookkeeping. Caller must hold self.lock.
+
+        Shared by the live path and the pre-roll flush so the two can't drift apart.
+        `arrival` is the frame's original wall-clock receive time - buffered frames keep
+        theirs, so overlays and the recording start time don't shift to flush time.
+        """
+        if self.video_writer is None or not self.video_writer.isOpened():
+            return
+
+        # Overlay timestamp if requested. Use the frame's own stamp so the on-screen
+        # clock advances at playback speed even when the sim runs faster/slower than
+        # wall time (wall clock would drift by the real-time factor).
+        if self.overlay_timestamp:
+            if stamp >= 1e9:
+                # Stamp is a real epoch (wall-clock-synced publisher)
+                text = datetime.fromtimestamp(stamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            elif stamp > 0.0:
+                # Sim clock that started near zero - show elapsed sim time
+                text = f"sim {stamp:.3f}s"
+            else:
+                # Unstamped publisher - the frame's arrival time is all we have
+                text = arrival.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            cv2.putText(
+                frame,
+                text,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
+
+        # Record start time when first frame is actually written; use the frame's
+        # arrival time so a flushed pre-roll keeps the recording's true start
+        if not self.first_frame_written:
+            self.recording_start_time = arrival
+            self.first_frame_written = True
+            # Signal that first frame has been written (thread-safe)
+            if self.first_frame_written_event and self.event_loop:
+                self.event_loop.call_soon_threadsafe(self.first_frame_written_event.set)
+        self.video_writer.write(frame)
+        self.frame_count += 1
+
+    def _flush_preroll(self):
+        """Write buffered detection-phase frames in arrival order. Caller must hold self.lock."""
+        for buf_frame, buf_stamp, buf_arrival in self.preroll_buffer:
+            self._write_frame(buf_frame, buf_stamp, buf_arrival)
+        self.preroll_buffer = []
+
     def image_callback(self, msg: Image):
         """Callback for image subscription"""
         if not self.is_recording:
@@ -169,111 +255,64 @@ class VideoRecorderNode(Node):
             stamp = _stamp_seconds(msg)
             self.sim_time_stamps = 0.0 < stamp < 1e9
 
-            # Auto-detect resolution from first frame if needed
-            if not self.video_writer_initialized:
-                if self.auto_resolution or self.height is None or self.width is None:
-                    self.height = frame.shape[0]
-                    self.width = frame.shape[1]
-                    self.get_logger().info(f"Auto-detected resolution: {self.width}x{self.height}")
+            arrival = datetime.now()
 
-                # Auto-detect FPS if needed (will calculate from first few frames)
-                fps_ready = False
+            # Auto-detect resolution from first frame if needed
+            if not self.video_writer_initialized and (
+                    self.auto_resolution or self.height is None or self.width is None):
+                self.height = frame.shape[0]
+                self.width = frame.shape[1]
+                self.get_logger().info(f"Auto-detected resolution: {self.width}x{self.height}")
+
+            # Resize if necessary (only if not auto-detected); buffered frames must be
+            # resized before buffering so the flush writes writer-sized frames
+            if not self.auto_resolution and (frame.shape[0] != self.height or frame.shape[1] != self.width):
+                frame = cv2.resize(frame, (self.width, self.height))
+
+            # Store latest frame in RGB for image capture (before timestamp overlay);
+            # updated during fps detection too, so capture works while buffering
+            self.latest_frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            if not self.video_writer_initialized:
                 if self.auto_fps and self.fps is None:
                     # We need to detect FPS - collect frame intervals. Prefer header
                     # stamps over wall-clock arrival time: under sim speedup/slowdown,
                     # wall intervals measure the simulator's real-time factor, not the
                     # camera's publish rate, and would make video duration depend on
                     # how fast the sim happened to run.
-                    current_time = stamp if stamp > 0.0 else datetime.now().timestamp()
+                    fps_ready = False
+                    current_time = stamp if stamp > 0.0 else arrival.timestamp()
                     if self.last_frame_time is not None:
                         frame_interval = current_time - self.last_frame_time
                         if frame_interval > 0:
                             self.frame_timestamps.append(frame_interval)
-                            # Use average of last 10 intervals for FPS calculation
-                            if len(self.frame_timestamps) >= 10:
-                                avg_interval = sum(self.frame_timestamps[-10:]) / len(self.frame_timestamps[-10:])
-                                self.fps = int(round(1.0 / avg_interval))
+                            if len(self.frame_timestamps) >= self.FPS_DETECT_INTERVALS:
+                                window = self.frame_timestamps[-self.FPS_DETECT_INTERVALS:]
+                                avg_interval = sum(window) / len(window)
+                                self.fps = max(1, int(round(1.0 / avg_interval)))
                                 self.get_logger().info(f"Auto-detected FPS: {self.fps}")
                                 fps_ready = True
                     self.last_frame_time = current_time
 
-                    # Only initialize VideoWriter after FPS is detected
-                    # This ensures we use the actual camera FPS, not a default
-                    if not fps_ready:
-                        # Skip this frame - we're still detecting FPS
-                        return
+                    with self.lock:
+                        # Buffer instead of dropping - detection costs no footage
+                        self.preroll_buffer.append((frame, stamp, arrival))
+                        if fps_ready:
+                            # FPS known: open the writer and flush the pre-roll. The
+                            # current frame is in the buffer - don't write it twice.
+                            self._open_video_writer()
+                            self._flush_preroll()
+                    return
                 else:
                     # FPS is explicitly set or auto_fps is disabled - we can proceed
                     if self.fps is None:
                         self.fps = 30  # Default fallback
-                    fps_ready = True
-
-                # Initialize video writer now that we have all parameters (including detected FPS)
-                fourcc = cv2.VideoWriter_fourcc(*self.video_codec)
-                self.video_writer = cv2.VideoWriter(
-                    self.output_path,
-                    fourcc,
-                    self.fps,
-                    (self.width, self.height)
-                )
-
-                if not self.video_writer.isOpened():
-                    raise RuntimeError(f"Failed to open video writer for {self.output_path}")
-
-                self.video_writer_initialized = True
-                # Don't set recording_start_time here - wait for first frame to be written
-                self.get_logger().info(f"Video writer initialized: {self.width}x{self.height} @ {self.fps} fps")
-                
-                # Signal that values are detected (thread-safe)
-                if self.values_detected_event and self.event_loop:
-                    self.event_loop.call_soon_threadsafe(self.values_detected_event.set)
-                
-                # Notify callback if values were auto-detected
-                if self.on_values_detected:
-                    self.on_values_detected()
-
-            # Resize if necessary (only if not auto-detected)
-            if not self.auto_resolution and (frame.shape[0] != self.height or frame.shape[1] != self.width):
-                frame = cv2.resize(frame, (self.width, self.height))
-
-            # Store latest frame in RGB for image capture (before timestamp overlay)
-            self.latest_frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            # Overlay timestamp if requested. Use the frame's own stamp so the on-screen
-            # clock advances at playback speed even when the sim runs faster/slower than
-            # wall time (datetime.now() would drift by the real-time factor).
-            if self.overlay_timestamp:
-                if stamp >= 1e9:
-                    # Stamp is a real epoch (wall-clock-synced publisher)
-                    timestamp = datetime.fromtimestamp(stamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                elif stamp > 0.0:
-                    # Sim clock that started near zero - show elapsed sim time
-                    timestamp = f"sim {stamp:.3f}s"
-                else:
-                    # Unstamped publisher - wall clock is all we have
-                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                cv2.putText(
-                    frame,
-                    timestamp,
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2
-                )
+                    with self.lock:
+                        self._open_video_writer()
 
             # Write frame to video
             with self.lock:
-                if self.video_writer and self.video_writer.isOpened():
-                    # Record start time when first frame is actually written
-                    if not self.first_frame_written:
-                        self.recording_start_time = datetime.now()
-                        self.first_frame_written = True
-                        # Signal that first frame has been written (thread-safe)
-                        if self.first_frame_written_event and self.event_loop:
-                            self.event_loop.call_soon_threadsafe(self.first_frame_written_event.set)
-                    self.video_writer.write(frame)
-                    self.frame_count += 1
+                self._write_frame(frame, stamp, arrival)
 
         except Exception as e:
             self.get_logger().error(f"Error processing frame: {e}")
@@ -284,6 +323,24 @@ class VideoRecorderNode(Node):
             # Set is_recording to False inside the lock to prevent race condition
             # where a frame could be mid-write when we call release()
             self.is_recording = False
+
+            # Salvage recordings stopped before auto-fps detection completed: derive a
+            # best-effort fps from the intervals collected so far and flush the pre-roll,
+            # so a short recording produces a (slightly fps-approximate) file instead of
+            # nothing at all.
+            if not self.video_writer_initialized and self.preroll_buffer:
+                avg_interval = (sum(self.frame_timestamps) / len(self.frame_timestamps)
+                                if self.frame_timestamps else 0)
+                self.fps = max(1, int(round(1.0 / avg_interval))) if avg_interval > 0 else 30
+                self.get_logger().warning(
+                    f"Stopped during fps detection - salvaging {len(self.preroll_buffer)} "
+                    f"buffered frames at best-effort {self.fps} fps")
+                try:
+                    self._open_video_writer()
+                    self._flush_preroll()
+                except Exception as e:
+                    self.get_logger().error(f"Failed to salvage pre-roll: {e}")
+
             if self.video_writer and self.video_writer.isOpened():
                 self.video_writer.release()
         self.get_logger().info(f"Recording stopped. Frames recorded: {self.frame_count}")
@@ -305,6 +362,9 @@ class VideoRecorderManager:
         self.rclpy_initialized = False
         self.executor = None
         self.executor_thread = None
+        # Set by cleanup() to make the spin loop exit even if recorder nodes are still
+        # registered (e.g. a stuck recording); see cleanup() for why that matters
+        self._shutdown_requested = False
         # Support multiple recorder nodes - dict keyed by camera topic
         self.recorder_nodes = {}
         # Track output paths for each topic
@@ -338,6 +398,7 @@ class VideoRecorderManager:
         if self.executor is None or not self.executor_thread.is_alive():
             from rclpy.executors import SingleThreadedExecutor
             self.executor = SingleThreadedExecutor()
+            self._shutdown_requested = False
             self.executor_thread = threading.Thread(
                 target=self._executor_spin,
                 daemon=True
@@ -346,7 +407,8 @@ class VideoRecorderManager:
 
     def _executor_spin(self):
         """Run the executor spin loop"""
-        while self.rclpy_initialized and len(self.recorder_nodes) > 0:
+        while (self.rclpy_initialized and len(self.recorder_nodes) > 0
+               and not self._shutdown_requested):
             try:
                 self.executor.spin_once(timeout_sec=0.1)
             except Exception as e:
@@ -1045,12 +1107,29 @@ class VideoRecorderManager:
         return "\n".join(results)
 
     async def cleanup(self):
-        """Cleanup when shutting down"""
+        """Cleanup when shutting down.
+
+        Library consumers (standalone scripts) MUST call this after stopping recordings
+        and before letting the process exit. The executor runs in a daemon thread: if the
+        interpreter tears down while that thread is inside rclcpp's spin_once, the C++
+        layer hits std::terminate ('terminate called without an active exception',
+        SIGABRT/exit 134). The shutdown order below makes even that path safe: stop the
+        spin loop FIRST, join the thread, and only then shut rclpy down - never pull the
+        rclpy context out from under a live executor.
+        """
         if self.is_recording():
             await self.stop_recording()
 
-        # Shutdown ROS2
-        if self.executor_thread:
+        # Stop the spin loop even if recorder nodes are still registered (stuck
+        # recording) - otherwise the join below just times out and rclpy.shutdown()
+        # fires under a spinning executor
+        self._shutdown_requested = True
+        if self.executor is not None:
+            try:
+                self.executor.shutdown(timeout_sec=2.0)
+            except Exception:
+                pass
+        if self.executor_thread and self.executor_thread.is_alive():
             self.executor_thread.join(timeout=2.0)
         if self.rclpy_initialized:
             try:
@@ -1058,6 +1137,7 @@ class VideoRecorderManager:
                 rclpy.shutdown()
             except Exception:
                 pass
+            self.rclpy_initialized = False
 
 
 # Standalone usage example
